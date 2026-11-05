@@ -1,0 +1,15 @@
+# FINAL FANTASY RESONANCE: Square Enix, Unreal Engine 5.6.1 (SF_GLSL_SWITCH shaders), SDK 20.5.17, NVN, CRIWARE sound; update 1.0.1 (v65536).
+# game.tsv is upstream's (brought up on the Mac and the iPhone); this file is what Android needs.
+# On the POCO F8 Ultra (25102PCBEG, Snapdragon 8 Elite gen 5 / Adreno 840, Android 16, HyperOS 3), test package org.nx2a.ffres.test, 2026-11-05:
+# the title screen, New Game (Normal), the difficulty prompt, the opening cutscene (the SDK's movie decoder), the first field (Battlefield) with its autosave, walking,
+# the game's System Menu and its Options tabs, and the first battle encounter. No red log line but one one-shot "[vk] buffer texture not in a pool" at the field's load,
+# which draws correctly after it. The title screen holds 60 fps; the field renders at 30 (frame work p50 24 ms, GPU 31-33 ms: the field is GPU-bound on this GPU at
+# the game's Switch resolution, and the adaptive governor settles at 30). Alias region high-water 2.01 GB of 4.38 GB, footprint 1.15 GB.
+#
+# The game's IoStore shader libraries are Oodle-compressed as a whole group (uepak.py Toc / io_archive): the port decodes them with the game's own Oodle on the device
+# (porter/pipeline.py ue_shaders, DM_OODLE_JOB) as it does Pokémon Legends: Arceus's GFPAKs and Z-A's Trinity packs, so a first port needs the device even without
+# --install; it writes <version>/ue_shaders and every later port reuses it. 73,496 shaders translate, as on the Mac.
+status	boots
+tested	v65536 POCO F8 Ultra (Snapdragon 8 Elite gen 5, Adreno 840, Android 16)
+package	org.nx2a.finalfantasyresonance
+orientation	landscape

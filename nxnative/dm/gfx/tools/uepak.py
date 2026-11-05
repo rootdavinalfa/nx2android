@@ -335,12 +335,12 @@ def io_library_name(toc, i, names):
         if city64(n[len('ShaderArchive-'):].lower().encode('utf-16-le')).to_bytes(8, 'little') == h: return n
     return f'ShaderArchive-IoStore-{h.hex()}'
 
-def io_archive(toc, i, decode):
-    """An IoStore shader library (Unreal Engine 5: FIoStoreShaderCodeArchive) as a version 2 shader code archive with every shader decoded, the form the shader tools read.
-    The library chunk: u32 version (1), shader map hashes (20 bytes each), shader hashes (20 each), the shader groups' chunk IDs (12 each), shader map entries {u32 first index, u32 shader count},
-    shader entries (u64: frequency in bits 0-3, group in 4-33, offset in the group's decoded bytes from bit 34), group entries {u32 first index, u32 shader count, u32 raw size, u32 stored size},
-    shader indices (u32): each a u32 count and its elements. Each group is one ShaderCode chunk holding its shaders end to end, Oodle-compressed as a whole when its stored size is below its raw
-    size (FINAL FANTASY RESONANCE: 5,919 groups of 74,244 shaders); a shader runs to the next shader's offset in its group, or to the group's end"""
+def io_parse(toc, i, decode=None):
+    """An IoStore shader library's tables (FIoStoreShaderCodeArchive, version 1). The library chunk: u32 version (1), shader map hashes (20 bytes each), shader hashes (20 each), the shader
+    groups' chunk IDs (12 each), shader map entries {u32 first index, u32 shader count}, shader entries (u64: frequency in bits 0-3, group in 4-33, offset in the group's decoded bytes from bit
+    34), group entries {u32 first index, u32 shader count, u32 raw size, u32 stored size}, shader indices (u32): each a u32 count and its elements. Each group is one ShaderCode chunk holding
+    its shaders end to end, Oodle-compressed as a whole when its stored size is below its raw size (FINAL FANTASY RESONANCE: 5,919 groups of 74,244 shaders); a shader runs to the next
+    shader's offset in its group, or to the group's end"""
     r = R(toc.read(i, decode))
     if r.take('<I') != 1: raise ValueError(f'{toc.path}: shader library chunk {i} is not version 1')
     maph = r.raw(20 * r.take('<I')); nsh = r.take('<I'); shh = r.raw(20 * nsh)
@@ -350,19 +350,30 @@ def io_archive(toc, i, decode):
     groups = [r.take('<IIII') for _ in range(r.take('<I'))]
     k = r.take('<I'); idx = struct.unpack_from(f'<{k}I', r.b, r.o); r.o += 4 * k
     if r.o != len(r.b) or n != nsh or len(gids) != len(groups): raise ValueError(f'{toc.path}: shader library chunk {i} does not parse')
+    return dict(maph=maph, shh=shh, gids=gids, maps=maps, n=n, ents=ents, groups=groups, idx=idx)
+
+def io_archive(toc, i, decode=None, groups=None):
+    """An IoStore shader library as a version 2 shader code archive with every shader decoded, the form the shader tools read. groups = {group: its decoded bytes}, for a caller that had
+    them decoded elsewhere (the Android device's Oodle, porter/pipeline.py ue_shaders); without it each group's chunk is read and, when compressed, decoded by decode (the game's Oodle)"""
+    p = io_parse(toc, i)
+    n, ents, idx = p['n'], p['ents'], p['idx']
     code = [None] * n
-    for g, (gid, (first, cnt, raw, stored)) in enumerate(zip(gids, groups)):
-        if gid not in toc.index: raise ValueError(f'{toc.path}: shader group {g} has no chunk')
-        d = toc.read(toc.index[gid], decode)
-        if len(d) != stored: raise ValueError(f'{toc.path}: shader group {g} is {len(d)} bytes, its entry says {stored}')
-        if stored < raw: d = decode(d, raw)
+    for g, (gid, (first, cnt, raw, stored)) in enumerate(zip(p['gids'], p['groups'])):
+        if groups is not None:
+            d = groups[g]
+            if len(d) != raw: raise ValueError(f'{toc.path}: shader group {g} was decoded to {len(d)} bytes, its entry says {raw}')
+        else:
+            if gid not in toc.index: raise ValueError(f'{toc.path}: shader group {g} has no chunk')
+            d = toc.read(toc.index[gid], decode)   # the container's blocks, decoded when the container compresses them
+            if len(d) != stored: raise ValueError(f'{toc.path}: shader group {g} is {len(d)} bytes, its entry says {stored}')
+            if stored < raw: d = decode(d, raw)
         mine = sorted(((ents[s] >> 34, s) for s in idx[first:first + cnt]))
         for (at, s), (nxt, _) in zip(mine, mine[1:] + [(raw, None)]):
             if (ents[s] >> 4) & 0x3FFFFFFF != g: raise ValueError(f'{toc.path}: shader {s} is listed in group {g} but names another')
             code[s] = d[at:nxt]
     if any(c is None for c in code): raise ValueError(f'{toc.path}: {sum(c is None for c in code)} shaders in no group')
-    out, off = bytearray(struct.pack('<II', ARCHIVE_VERSION, len(maph) // 20) + maph + struct.pack('<I', n) + shh + struct.pack('<I', len(maps))), 0
-    for a, c in maps: out += struct.pack('<IIII', a, c, 0, 0)
+    out, off = bytearray(struct.pack('<II', ARCHIVE_VERSION, len(p['maph']) // 20) + p['maph'] + struct.pack('<I', n) + p['shh'] + struct.pack('<I', len(p['maps']))), 0
+    for a, c in p['maps']: out += struct.pack('<IIII', a, c, 0, 0)
     out += struct.pack('<I', n)
     for e, c in zip(ents, code): out += struct.pack('<QIIB', off, len(c), len(c), e & 0xF); off += len(c)
     out += struct.pack('<I', 0) + struct.pack(f'<I{len(idx)}I', len(idx), *idx)
@@ -402,6 +413,15 @@ def unreal_paks(romfs, legacy=None):
         except (OSError, ValueError, struct.error): continue   # shorter than a footer, or no Unreal pak
         if legacy is None or (ver in LEGACY) == legacy: out.append(p)
     return out
+
+def pak_shader_archives(romfs):
+    """How many shader code archives the version 11 paks under the RomFS hold (their shaders are Oodle-compressed one at a time: decode_ue_shaders' job). A pak whose index cannot be read
+    counts as one, so a game is never sent down the IoStore route with its shaders in an unreadable pak"""
+    found = 0
+    for p in unreal_paks(romfs, legacy=False):
+        try: found += sum(1 for x in Pak(p).files if x.endswith('.ushaderbytecode'))
+        except (OSError, ValueError, struct.error): found += 1
+    return found
 
 def job(romfs, main_nso, work, decode=None):
     """The shader code archives of every pak under the RomFS into <work>/archives, and one Oodle job (<work>/oodle.job) of every compressed shader in them; <work>/job.json lists them.

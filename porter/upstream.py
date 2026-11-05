@@ -15,6 +15,7 @@ import game              # noqa: E402
 import nacp              # noqa: E402
 import profile_guess     # noqa: E402
 import trinity           # noqa: E402
+import uepak             # noqa: E402
 
 
 def _load_nsp():
