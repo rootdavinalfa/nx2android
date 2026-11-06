@@ -9,6 +9,14 @@
 # The game's IoStore shader libraries are Oodle-compressed as a whole group (uepak.py Toc / io_archive): the port decodes them with the game's own Oodle on the device
 # (porter/pipeline.py ue_shaders, DM_OODLE_JOB) as it does Pokémon Legends: Arceus's GFPAKs and Z-A's Trinity packs, so a first port needs the device even without
 # --install; it writes <version>/ue_shaders and every later port reuses it. 73,496 shaders translate, as on the Mac.
+#
+# Open on Android: some opaque props (a flight of stairs, a rock) and a ground shadow drop out for single frames, about a fifth of the presents of a still field scene,
+# in the game's own presented frames (DM_VK_SHOTS), so not at presentation; it is in this fork's Vulkan backend. Ruled out so far, each A/B'd live over 20 presented
+# frames of the same still scene: command-buffer cuts (DM_VK_CB_DRAWS=0), back-face culling (DM_VK_NOCULL=1), the LRZ touches (DM_VK_LRZ_TOUCH=0), fragment-depth
+# variants (DM_VK_FDZ=0), the sampler snapshot (DM_NVN_SAMP_SNAP=0), the transform-feedback read touch (DM_VK_RD_TOUCH=0) and GPU turbo (DM_GPU_TURBO=1) each left a
+# comparable count (2-6 of 20) of missing-prop frames. The reference implementation's FINAL FANTASY RESONANCE work is in nvn_mtl.m (Metal), which this fork does not
+# build, so it is not a source to copy from for this. Two Unreal shader-translator fixes since this fork's nxnative snapshot (chain 9bb5d8678204, 3dd02e581c0c) are
+# candidates: they change SPIR-V for handles in uniform buffers and guarded loads, both used by UE 5.6, and need a re-translate to test.
 status	boots
 tested	v65536 POCO F8 Ultra (Snapdragon 8 Elite gen 5, Adreno 840, Android 16)
 package	org.nx2a.finalfantasyresonance
