@@ -600,34 +600,6 @@ static void menu_do(int item) {
     if (item >= 0 && item < OVM_N) dm_haptics_android_tap();
     if (item == OVM_RESUME) menu_close(); else dm_overlay_redraw();
 }
-// ---- the start screen (overlay_layout.h START_*): the game starts from here, and the skip switch keeps it from showing again ----
-static void start_host(void);
-static int romfs_readable(ANativeActivity *act, int sdk);
-static void start_screen_do(int item) {
-    if (item == START_ROMFS) { romfs_location_change(); dm_overlay_redraw(); return; }
-    if (item == START_SAVE) { save_folder_change(); dm_overlay_redraw(); return; }
-    if (item == START_EXPORT) { save_export_to(); dm_overlay_redraw(); return; }
-    if (item == START_IMPORT) { save_import_from(); dm_overlay_redraw(); return; }
-    if (item == START_RETRY) {   // the RomFS was missing: check it again before starting
-        if (!romfs_readable(g_act, g_sdk)) { dm_overlay_redraw(); return; }
-        atomic_store(&g_romfs_missing, 0);
-    }
-    if (atomic_load(&g_running)) { atomic_store(&g_start_screen, 0); dm_overlay_redraw(); return; }   // opened from the pause menu: back to the game
-    if (item == START_SKIP) { atomic_store(&g_start_screen, 0); settings_save(); }
-    else atomic_store(&g_start_screen, 0);
-    dm_haptics_android_tap(); start_host();
-}
-static void start_touch(AInputEvent *e, float W, float H) {
-    if ((AMotionEvent_getAction(e) & AMOTION_EVENT_ACTION_MASK) != AMOTION_EVENT_ACTION_UP) return;
-    int row = ov_menu_row_at(AMotionEvent_getX(e, 0), AMotionEvent_getY(e, 0), W, H);
-    if (row >= 0 && row < START_N) start_screen_do(row);
-}
-static void start_key(uint64_t bit) {
-    int hi = atomic_load(&g_start_hi);
-    if (bit == DM_BTN_UP || bit == DM_BTN_DOWN) { hi = (hi + (bit == DM_BTN_UP ? START_N - 1 : 1)) % START_N; atomic_store(&g_start_hi, hi); dm_overlay_redraw(); }
-    else if (bit == DM_BTN_A) start_screen_do(hi);
-    else if (bit == DM_BTN_B || bit == DM_BTN_PLUS) start_screen_do(START_GAME);
-}
 static void menu_touch(AInputEvent *e, float W, float H) {   // a press on a row does it when it lifts there; a tap outside the panel or on the menu button closes
     int act = AMotionEvent_getAction(e) & AMOTION_EVENT_ACTION_MASK, ai = AMotionEvent_getAction(e) >> AMOTION_EVENT_ACTION_POINTER_INDEX_SHIFT;
     int i = act == AMOTION_EVENT_ACTION_DOWN || act == AMOTION_EVENT_ACTION_UP ? 0 : ai, id = AMotionEvent_getPointerId(e, (size_t)i) & 31;
@@ -673,6 +645,34 @@ static void menu_key(uint64_t bit) {   // a controller key pressed while the men
     else if (bit == DM_BTN_B || bit == DM_BTN_PLUS) menu_close();
 }
 
+// ---- the start screen (overlay_layout.h START_*): the game starts from here, and the skip switch keeps it from showing again ----
+static void start_host(void);
+static int romfs_readable(ANativeActivity *act, int sdk);
+static void start_screen_do(int item) {
+    if (item == START_ROMFS) { romfs_location_change(); dm_overlay_redraw(); return; }
+    if (item == START_SAVE) { save_folder_change(); dm_overlay_redraw(); return; }
+    if (item == START_EXPORT) { save_export_to(); dm_overlay_redraw(); return; }
+    if (item == START_IMPORT) { save_import_from(); dm_overlay_redraw(); return; }
+    if (item == START_RETRY) {   // the RomFS was missing: check it again before starting
+        if (!romfs_readable(g_act, g_sdk)) { dm_overlay_redraw(); return; }
+        atomic_store(&g_romfs_missing, 0);
+    }
+    if (atomic_load(&g_running)) { atomic_store(&g_start_screen, 0); dm_overlay_redraw(); return; }   // opened from the pause menu: back to the game
+    if (item == START_SKIP) { atomic_store(&g_start_screen, 0); settings_save(); }
+    else atomic_store(&g_start_screen, 0);
+    dm_haptics_android_tap(); start_host();
+}
+static void start_touch(AInputEvent *e, float W, float H) {
+    if ((AMotionEvent_getAction(e) & AMOTION_EVENT_ACTION_MASK) != AMOTION_EVENT_ACTION_UP) return;
+    int row = ov_menu_row_at(AMotionEvent_getX(e, 0), AMotionEvent_getY(e, 0), W, H);
+    if (row >= 0 && row < START_N) start_screen_do(row);
+}
+static void start_key(uint64_t bit) {
+    int hi = atomic_load(&g_start_hi);
+    if (bit == DM_BTN_UP || bit == DM_BTN_DOWN) { hi = (hi + (bit == DM_BTN_UP ? START_N - 1 : 1)) % START_N; atomic_store(&g_start_hi, hi); dm_overlay_redraw(); }
+    else if (bit == DM_BTN_A) start_screen_do(hi);
+    else if (bit == DM_BTN_B || bit == DM_BTN_PLUS) start_screen_do(START_GAME);
+}
 // ---- the save manager (saves_android.c): Export save copies the game's committed save to the files folder's saves/ on a thread of its own (the row shows it
 // copying, then the export's name); Import save opens the picker, in the menu's panel (overlay_layout.h OVS_*): the saves there newest first, a page of
 // OVM_ROWS - 2 (left and right, L and R page), Back. A save chosen asks first; the import then waits for the next start (the save is not touched while the

@@ -53,6 +53,9 @@ static void save_export(void) {}
 static void menu_audio(void) {}
 static void menu_close(void) {}
 static void dm_overlay_redraw(void) {}
+static _Atomic int g_start_screen, g_start_hi, g_running;
+static void start_touch(void *e, float W, float H) { (void)e; (void)W; (void)H; }
+static void start_key(uint64_t bit) { (void)bit; }
 ''' + visible + hidden + hit + menu + r'''
 // Synthetic Android events. The production dispatch and touch handlers below consume them.
 enum { AINPUT_SOURCE_TOUCHSCREEN = 1, AINPUT_SOURCE_GAMEPAD = 2, AINPUT_SOURCE_JOYSTICK = 4 };
