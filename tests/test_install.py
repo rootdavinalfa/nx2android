@@ -282,6 +282,14 @@ class ContainerAt(unittest.TestCase):
         self.assertNotEqual(dev.step('push_file', '/sdcard/Games/Test/romfs.nxz'), -1)
         self.assertEqual(dev.step('push_tree', 'RomFS'), -1)
         self.assertIn('DM_ROMFS_CONTAINER=/sdcard/Games/Test/romfs.nxz', dev.text[f'{FILES}/env.txt'])
+        self.assertNotEqual(dev.step('shell', 'appops set'), -1)   # a container outside the files folder needs All files access
+
+    def test_container_location_carries_over(self):
+        dev = Device()
+        install.Adb = lambda exe, serial=None, log=print: dev
+        install.install(self.apk, self.data, 'adb', container_at='/sdcard/Games/Test/romfs.nxz')
+        install.install(self.apk, self.data, 'adb')   # no --container-at: the earlier location is kept
+        self.assertIn('DM_ROMFS_CONTAINER=/sdcard/Games/Test/romfs.nxz', dev.text[f'{FILES}/env.txt'])
 
 
 if __name__ == '__main__':

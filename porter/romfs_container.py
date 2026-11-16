@@ -28,7 +28,7 @@ def is_container(path):
 
 def _pack_one(src, out, zstd):
     """src's block table and blocks at out's current position → (raw size, block size, block count, block table offset)"""
-    size = src.stat().st_size; n = max(1, (size + BLOCK - 1) // BLOCK)
+    size = src.stat().st_size; n = (size + BLOCK - 1) // BLOCK   # 0 for an empty file: an empty block table, no blocks
     table = out.tell(); out.write(b'\0' * (8 * (n + 1)))
     offs = [table + 8 * (n + 1)]
     with open(src, 'rb') as f:

@@ -152,10 +152,15 @@ def install(apk, data, adb_exe, serial=None, replace_signer=False, romfs_at=None
             if bc is False: raise BuildError(f'{man["name"]} needs BC-compressed textures, which this device\'s GPU ({adb.gpu()}) cannot read')
             if bc is None: say(f'[RED] {man["name"]} needs BC-compressed textures; whether this GPU ({adb.gpu() or "unknown"}) reads them is not known')
         was = device_romfs(adb.read_text(f'{files}/env.txt'))   # an earlier --romfs-at install's folder
+        was_container = device_container(adb.read_text(f'{files}/env.txt'))   # an earlier --container-at install's file
+        if container_path is None and was_container:
+            container_path = container_target(was_container)
+            if container_path: say(f'the app reads its RomFS container from {container_path} (an earlier install\'s --container-at)')
         if container_path is None and romfs_at is None and was:
             target = romfs_target(was, files)
             if packed and target: raise BuildError(f'the app reads its RomFS from {target} (an earlier install\'s --romfs-at). ' + PACKED_ELSEWHERE)
             if target: say(f'the app reads its RomFS from {target} (an earlier install\'s --romfs-at; --romfs-at app moves it into its files folder)')
+        needs_access = bool(target) or (container_path is not None and not container_path.startswith(files + '/'))
         rom = datapack.romfs_sizes(data) if target else {}
         missing = other = changed = []; there = {}
         if target:   # what can refuse comes before the APK goes in, so a refused install changes nothing on the device (but a new app's grant: below)
@@ -176,6 +181,8 @@ def install(apk, data, adb_exe, serial=None, replace_signer=False, romfs_at=None
                                         ', add --romfs-push to put the pack\'s RomFS into that folder') + ', or --romfs-at app to keep the RomFS in the app\'s files folder')
                 say(f'{target}: {len(missing) + len(other) + len(changed):,} of the RomFS\'s {len(rom):,} files to push (--romfs-push)')
             else: say(f'{target} holds this pack\'s RomFS ({len(rom):,} files, {sum(rom.values()) / 2**30:.1f} GB): it is not pushed')
+        if needs_access and not apk_asks_access(apk):
+            raise BuildError(f'{apk.name} does not ask for All files access, which reading {container_path or target} needs (a port made by an earlier nx2android): port the game again')
         free = adb.free_bytes()
         have = adb.remote_sizes(files)
         if target:   # the RomFS is not pushed into the files folder; a copy an earlier install left there goes only after env.txt points elsewhere, so it is not counted as freed
@@ -185,24 +192,24 @@ def install(apk, data, adb_exe, serial=None, replace_signer=False, romfs_at=None
                 elif (tfree := adb.free_bytes(target)) is not None and push > tfree: raise BuildError(f'{target}\'s volume has {tfree / 2**30:.1f} GB free; the RomFS needs {push / 2**30:.1f} GB more')
         else: need = man['bytes'] - sum(have.values())
         if free is not None and need > free: raise BuildError(f'the device has {free / 2**30:.1f} GB free; the game needs {need / 2**30:.1f} GB more')
-        if target and not replace_signer and adb.installed(man['package']):   # an update: the grant (the app's uid's, which the update keeps) before the APK goes in
+        if needs_access and not replace_signer and adb.installed(man['package']):   # an update: the grant (the app's uid's, which the update keeps) before the APK goes in
             PROG.set(step='granting the app All files access')
             ok, state = adb.storage_access(man['package'], grant=True)
             if not ok and adb.requests_permission(man['package'], ACCESS if adb.sdk() >= 30 else 'android.permission.READ_EXTERNAL_STORAGE'):
-                raise BuildError(f'the app needs All files access to read {target}, and the device did not grant it over adb ({state}): allow it on the device '
+                raise BuildError(f'the app needs All files access to read {container_path or target}, and the device did not grant it over adb ({state}): allow it on the device '
                                  f'({ACCESS_HOW.format(name=man["name"])}), then install again')
         PROG.set(step=f'installing {apk.name}')
         adb.install(apk, man['package'], replace_signer=replace_signer)
         PROG.set(step='letting the app create its files folder')
         if adb.prepare_app_files(man['package']): say('started the app once so Android made its files folder (it stops at once without its data)')
-        if target:   # after the install too: a new package, one --replace-signer made again, or an update from an APK that did not ask for the access (granted above
+        if needs_access:   # after the install too: a new package, one --replace-signer made again, or an update from an APK that did not ask for the access (granted above
             # when it did) has no grant yet. Before the push, so a refusal leaves the data as it was: a new app has none, and an older APK's update is the one case
             # that cannot be refused before the APK goes in
             PROG.set(step='granting the app All files access')
             ok, state = adb.storage_access(man['package'], grant=True)
-            if not ok: raise BuildError(f'the app needs All files access to read {target}, and the device did not grant it over adb ({state}): allow it on the device '
+            if not ok: raise BuildError(f'the app needs All files access to read {container_path or target}, and the device did not grant it over adb ({state}): allow it on the device '
                                         f'({ACCESS_HOW.format(name=man["name"])}), then install again')
-            say(f'{state}: the app reads its RomFS from {target}')
+            say(f'{state}: the app reads its RomFS from {container_path or target}')
         PROG.set(step='pushing the game data', done=0, total=man['bytes'] - sum(rom.values()), unit='B'); pushing = True
         have = adb.remote_sizes(files)   # again: an install with --replace-signer uninstalls first, and Android deletes the files folder with the app
         skip = (datapack.MANIFEST,) + (('env.txt',) if target else ()) + (('romfs.nxz',) if container_path else ())

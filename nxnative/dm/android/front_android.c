@@ -14,6 +14,8 @@
 #include "saves_android.h"
 #include <math.h>
 #include <time.h>
+#include <fcntl.h>
+#include <unistd.h>
 #include <android/asset_manager.h>
 #include <android/configuration.h>
 #include <android/input.h>
@@ -79,7 +81,7 @@ static _Atomic int g_set_overlay = 1, g_set_rumble = 1, g_set_fps;   // the game
 static _Atomic int g_set_opacity = 60;   // the gamepad's opacity, percent (OV_OPACITY_MIN..MAX: the menu's Opacity slider)
 static _Atomic int g_set_grid;   // the layout editor's Snap to grid
 static _Atomic int g_set_labels = -1;   // a controller's face buttons by their label (1) or their position (0); -1: as env.txt says (pad_labels)
-static _Atomic int g_start_screen = 1, g_start_hi, g_romfs_missing;   // the start screen (settings.txt start_screen=), its highlighted row, the missing-RomFS notice
+static _Atomic int g_start_screen = 1, g_start_hi, g_romfs_missing, g_start_from_menu;   // the start screen (settings.txt start_screen=), its highlighted row, the missing-RomFS notice, opened from the pause menu
 static char g_save_folder[600];   // settings.txt save_folder=: the game's save folder (a normal path), empty: the app's internal save
 // the player's own layout (overlay_layout.h dm_overlay_custom): [0] the saved one (settings.txt ui= rows), [1] the layout editor's while it is open; per layout
 // and control: x + 1, y + 1 in 1/10000 of the window's width and height (0 = the layout's place), the size factor in 1/1000 (0 = 1), 1 when hidden
@@ -89,7 +91,7 @@ static const char *const LAYOUT_NAMES[2] = {"tablet", "phone"};
 static int ctl_named(const char *n) { for (int i = 0; i < OV_N; i++) if (!strcmp(OV_LAYOUTS[0][i].name, n)) return i; return -1; }
 int dm_opmode(void); void dm_set_opmode(int m);   // hle_oe.c: 0 handheld, 1 docked; a change reaches the game as the Switch's operation mode notification
 static void settings_load(void) {
-    char p[600]; snprintf(p, sizeof p, "%s/settings.txt", g_root); FILE *f = fopen(p, "r"); char line[128];
+    char p[600]; snprintf(p, sizeof p, "%s/settings.txt", g_root); FILE *f = fopen(p, "r"); char line[1024];
     if (!f) return;
     while (fgets(line, sizeof line, f)) { int v; if (sscanf(line, "overlay=%d", &v) == 1) atomic_store(&g_set_overlay, v != 0); else if (sscanf(line, "rumble=%d", &v) == 1) atomic_store(&g_set_rumble, v != 0);
         else if (sscanf(line, "fps=%d", &v) == 1) atomic_store(&g_set_fps, v != 0);
@@ -494,8 +496,8 @@ static _Atomic int g_ed_st;    // the layout editor's state for dm_menu_state (o
 static _Atomic int g_sp_on, g_sp_hi = -1, g_sp_ver;   // the save picker (below): open, its highlighted row, its edit count
 static _Atomic int g_sv_st, g_sv_n;                   // Export save: its outcome (overlay_layout.h OVX_*), the exports made
 int dm_menu_state(void) {
-    if (atomic_load(&g_start_screen)) return START_ST | (atomic_load(&g_start_hi) + 1) << 4 | (atomic_load(&g_romfs_missing) ? 1 : 0) << 8 | (atomic_load(&g_running) ? 1 : 0) << 9;
     if (atomic_load(&g_tx_on)) return 1 << 16 | (atomic_load(&g_tx_ver) & 0xffff);   // the text entry's panel (gfx_vk_present.c ov_text_panel)
+    if (atomic_load(&g_start_screen)) return START_ST | (atomic_load(&g_start_hi) + 1) << 4 | (atomic_load(&g_romfs_missing) ? 1 : 0) << 8 | (atomic_load(&g_start_from_menu) ? 1 : 0) << 9;
     if (!atomic_load(&g_menu)) return -1;
     if (atomic_load(&g_edit)) return OVE_ST | atomic_load(&g_ed_st);
     if (atomic_load(&g_sp_on)) return OVS_ST | (atomic_load(&g_sp_hi) + 1) << 4 | (atomic_load(&g_sp_ver) & 255) << 20;
@@ -552,6 +554,8 @@ static void romfs_location_change(void) {   // the start screen's ROM data locat
     if (!ask_path("ROM data location", old, path, sizeof path)) return;
     if (!path[0] || path[0] != '/') { LOG("[RED] RomFS location: %s is not an absolute path", path); return; }
     char dst[1024]; snprintf(dst, sizeof dst, "%s/RomFS", path);
+    size_t ol = strlen(old);
+    if (!strncmp(dst, old, ol) && (dst[ol] == '/' || !dst[ol])) { LOG("[RED] RomFS location: %s is inside %s", dst, old); return; }   // the field starts at the current location: accepting it must not copy into itself
     long files = 0; long long bytes = 0; char err[400] = "";
     int r = dm_copy_tree(old, dst, &files, &bytes, err, sizeof err);
     if (r) { LOG("[RED] RomFS location: copying %s to %s failed: %s", old, dst, err); return; }
@@ -564,9 +568,20 @@ static void save_folder_change(void) {   // the start screen's save folder: the 
     char path[512] = "";
     if (!ask_path("Save folder", g_save_folder, path, sizeof path)) return;
     if (!path[0] || path[0] != '/') { LOG("[RED] save folder: %s is not an absolute path", path); return; }
-    snprintf(g_save_folder, sizeof g_save_folder, "%s", path);
+    struct stat st; if (stat(path, &st) || !S_ISDIR(st.st_mode)) { LOG("[RED] save folder: %s is not a folder", path); return; }
+    if (access(path, W_OK)) { LOG("[RED] save folder: %s is not writable", path); return; }
+    char dst[700]; snprintf(dst, sizeof dst, "%s/save", path);
+    if (stat(dst, &st)) {   // no save there yet: move the current one, so the game does not start with an empty save
+        const char *cur = getenv("DM_SAVE");
+        if (cur && *cur) {
+            long files = 0; long long bytes = 0; char err[400] = "";
+            if (dm_copy_tree(cur, dst, &files, &bytes, err, sizeof err)) { LOG("[RED] save folder: copying %s to %s failed: %s", cur, dst, err); return; }
+            LOG("save folder: the save moved to %s (%ld files, %lld bytes)", dst, files, bytes);
+        }
+    }
+    snprintf(g_save_folder, sizeof g_save_folder, "%s", dst);
     settings_save();
-    LOG("save folder: %s (the game's save moves there at the next start)", path);
+    LOG("save folder: %s (the game's save moves there at the next start)", dst);
 }
 static void save_export_to(void) {   // the start screen's Export save to folder: a timestamped subfolder of the typed folder
     char path[512] = "";
@@ -596,7 +611,7 @@ static void menu_do(int item) {
     else if (item == OVM_EXPORT) { if (atomic_load(&g_sv_st) == OVX_BUSY) return; save_export(); }
     else if (item == OVM_IMPORT) { dm_haptics_android_tap(); sp_open(); return; }
     else if (item == OVM_AUDIO) { menu_audio(); }
-    else if (item == OVM_START) { atomic_store(&g_start_screen, 1); atomic_store(&g_start_hi, 0); menu_close(); dm_overlay_redraw(); return; }
+    else if (item == OVM_START) { atomic_store(&g_start_from_menu, 1); atomic_store(&g_start_screen, 1); atomic_store(&g_start_hi, 0); menu_close(); dm_overlay_redraw(); return; }
     if (item >= 0 && item < OVM_N) dm_haptics_android_tap();
     if (item == OVM_RESUME) menu_close(); else dm_overlay_redraw();
 }
@@ -648,19 +663,22 @@ static void menu_key(uint64_t bit) {   // a controller key pressed while the men
 // ---- the start screen (overlay_layout.h START_*): the game starts from here, and the skip switch keeps it from showing again ----
 static void start_host(void);
 static int romfs_readable(ANativeActivity *act, int sdk);
+typedef struct { void (*fn)(void); } async_t;
+static void *async_run(void *p) { async_t *a = p; a->fn(); free(a); return NULL; }
+static void run_async(void (*fn)(void)) { async_t *a = malloc(sizeof *a); if (!a) return; a->fn = fn; pthread_t t; if (pthread_create(&t, NULL, async_run, a)) { free(a); return; } pthread_detach(t); }
 static void start_screen_do(int item) {
-    if (item == START_ROMFS) { romfs_location_change(); dm_overlay_redraw(); return; }
-    if (item == START_SAVE) { save_folder_change(); dm_overlay_redraw(); return; }
-    if (item == START_EXPORT) { save_export_to(); dm_overlay_redraw(); return; }
-    if (item == START_IMPORT) { save_import_from(); dm_overlay_redraw(); return; }
-    if (item == START_RETRY) {   // the RomFS was missing: check it again before starting
+    if (item == START_ROMFS) { run_async(romfs_location_change); return; }   // the keyboard blocks: off the input thread
+    if (item == START_SAVE) { run_async(save_folder_change); return; }
+    if (item == START_EXPORT) { run_async(save_export_to); return; }
+    if (item == START_IMPORT) { run_async(save_import_from); return; }
+    if (atomic_load(&g_romfs_missing)) {   // the RomFS was missing: check it again before starting
         if (!romfs_readable(g_act, g_sdk)) { dm_overlay_redraw(); return; }
         atomic_store(&g_romfs_missing, 0);
     }
-    if (atomic_load(&g_running)) { atomic_store(&g_start_screen, 0); dm_overlay_redraw(); return; }   // opened from the pause menu: back to the game
     if (item == START_SKIP) { atomic_store(&g_start_screen, 0); settings_save(); }
     else atomic_store(&g_start_screen, 0);
-    dm_haptics_android_tap(); start_host();
+    atomic_store(&g_start_from_menu, 0);
+    dm_haptics_android_tap(); hold_sync(); dm_overlay_redraw();   // the host is already running, held: release it
 }
 static void start_touch(AInputEvent *e, float W, float H) {
     if ((AMotionEvent_getAction(e) & AMOTION_EVENT_ACTION_MASK) != AMOTION_EVENT_ACTION_UP) return;
@@ -1009,7 +1027,7 @@ __attribute__((weak)) void dm_picture_rect(float r[4]);   // gfx_vk_present.c
 static void touch_event(AInputEvent *e) {
     ANativeWindow *w = phone_window(); float W = w ? (float)ANativeWindow_getWidth(w) : 1, H = w ? (float)ANativeWindow_getHeight(w) : 1;
     if (atomic_load(&g_tx_on)) { tx_touch(e, W, H); return; }   // the text entry's keys
-    if (atomic_load(&g_start_screen) && !atomic_load(&g_running)) { start_touch(e, W, H); return; }
+    if (atomic_load(&g_start_screen)) { start_touch(e, W, H); return; }
     if (atomic_load(&g_menu)) { if (atomic_load(&g_edit)) ed_touch(e, W, H); else if (atomic_load(&g_sp_on)) sp_touch(e, W, H); else menu_touch(e, W, H); return; }
     int act = AMotionEvent_getAction(e) & AMOTION_EVENT_ACTION_MASK, ai = AMotionEvent_getAction(e) >> AMOTION_EVENT_ACTION_POINTER_INDEX_SHIFT;
     size_t pc = AMotionEvent_getPointerCount(e);
@@ -1087,7 +1105,7 @@ static int handle_event(AInputEvent *e) {
             return 0;
         }
         if (down) pad_mark_used(AInputEvent_getDeviceId(e));   // a release after a touch must not hide the controls again
-        if (atomic_load(&g_start_screen) && !atomic_load(&g_running)) { if (down && AKeyEvent_getRepeatCount(e) == 0) start_key(bit); return 1; }
+        if (atomic_load(&g_start_screen)) { if (down && AKeyEvent_getRepeatCount(e) == 0) start_key(bit); return 1; }
         if (atomic_load(&g_menu)) { if (down && AKeyEvent_getRepeatCount(e) == 0) menu_key(bit); return 1; }
         if (down) g_btn |= bit; else if (AKeyEvent_getAction(e) == AKEY_EVENT_ACTION_UP) g_btn &= ~bit;
         dm_pad_players(1); pad_publish(); return 1;
@@ -1256,7 +1274,7 @@ static void *input_thread(void *a) {
         int toggle = atomic_exchange(&g_ext_menu, 0);
         if (toggle & 1) { if (atomic_load(&g_menu)) menu_close(); else menu_open(0); }
         uint64_t b = atomic_load(&g_ext_buttons), presses = atomic_exchange(&g_ext_presses, 0);
-        if (atomic_load(&g_start_screen) && !atomic_load(&g_running)) { uint64_t down = (b & ~prev) | presses; latched = 0; for (int i = 0; i < 16; i++) if (down & (1ull << i)) start_key(1ull << i); dm_input_set(0, 0, 0, 0, 0); }
+        if (atomic_load(&g_start_screen)) { uint64_t down = (b & ~prev) | presses; latched = 0; for (int i = 0; i < 16; i++) if (down & (1ull << i)) start_key(1ull << i); dm_input_set(0, 0, 0, 0, 0); }
         else if (atomic_load(&g_menu)) { uint64_t down = (b & ~prev) | presses; latched = 0; for (int i = 0; i < 16; i++) if (down & (1ull << i)) menu_key(1ull << i); dm_input_set(0, 0, 0, 0, 0); }
         else {
             int64_t elapsed = mono_ns() - since;
@@ -1315,11 +1333,20 @@ static void open_access_page(ANativeActivity *act, int sdk) {   // the app's All
     } while (0);
     LOG("[RED] RomFS: Android's All files access page could not be opened: open it by hand (Settings > Apps > the game)");
 }
+static int is_container_file(const char *p) {   // a single-file RomFS (porter/romfs_container.py): the host extracts it
+    int fd = open(p, O_RDONLY); if (fd < 0) return 0;
+    char m[4]; int ok = read(fd, m, 4) == 4 && !memcmp(m, "NXZC", 4); close(fd); return ok;
+}
 static int romfs_readable(ANativeActivity *act, int sdk) {   // 0: the game cannot read its RomFS, and the app ends
     const char *r = getenv("DM_ROMFS"), *own[] = {g_root, act->internalDataPath}; char rr[4096], orr[4096];
     const char *rp = r && realpath(r, rr) ? rr : r;   // canonical paths: /sdcard/… is the /storage/emulated/0/… Android names the files folder by
+    int own_path = 0;
     for (int i = 0; i < 2; i++) { const char *o = own[i] && realpath(own[i], orr) ? orr : own[i]; size_t n = o ? strlen(o) : 0;
-        if (!rp || (n && !strncmp(rp, o, n) && (rp[n] == '/' || !rp[n]))) return 1; }   // the app's own folders need no permission
+        if (!rp || (n && !strncmp(rp, o, n) && (rp[n] == '/' || !rp[n]))) { own_path = 1; break; } }
+    struct stat st; int e = stat(r, &st) ? errno : (S_ISDIR(st.st_mode) || (S_ISREG(st.st_mode) && is_container_file(r))) ? 0 : ENOTDIR;
+    if (e) { LOG("[RED] RomFS: %s is not there (errno=%d): an SD card that is not in, a folder moved or renamed, or a container file that is not one; "
+                 "porter install --romfs-at <folder> or --container-at <file> points the app at it. The game is not started", r, e); return 0; }
+    if (own_path) return 1;   // the app's own folders need no permission
     JNIEnv *E = act->env; jclass c; jmethodID m; int ok = -1;   // -1: not known
     if (sdk >= 30) { c = (*E)->FindClass(E, "android/os/Environment"); m = c ? (*E)->GetStaticMethodID(E, c, "isExternalStorageManager", "()Z") : NULL; if (m) ok = (*E)->CallStaticBooleanMethod(E, c, m) ? 1 : 0; }
     else { jstring s = (*E)->NewStringUTF(E, "android.permission.READ_EXTERNAL_STORAGE"); c = (*E)->GetObjectClass(E, act->clazz);
@@ -1333,9 +1360,6 @@ static int romfs_readable(ANativeActivity *act, int sdk) {   // 0: the game cann
         open_access_page(act, sdk); return 0;
     }
     if (ok < 0) LOG("[RED] RomFS: %s is outside the app's files folder, and whether the app has %s is not known (a Java call failed): starting the game anyway", r, what);
-    struct stat st; int e = stat(r, &st) ? errno : S_ISDIR(st.st_mode) ? 0 : ENOTDIR;
-    if (e) { LOG("[RED] RomFS: %s is not there (errno=%d): an SD card that is not in, or a folder moved or renamed; porter install --romfs-at <folder> points the app at it "
-                 "(--romfs-at app: back into the files folder). The game is not started", r, e); return 0; }
     LOG("RomFS: %s, outside the app's files folder (%s granted)", r, what);
     return 1;
 }
@@ -1364,6 +1388,7 @@ __attribute__((visibility("default"))) void ANativeActivity_onCreate(ANativeActi
     snprintf(p, sizeof p, "%s/temp", act->internalDataPath); mkdir(p, 0700); setenv("DM_TEMP", p, 0);
     snprintf(p, sizeof p, "%s/shaders.dmsv", g_root); setenv("DM_VK_SHADERS", p, 0);
     snprintf(p, sizeof p, "%s/env.txt", g_root); env_file(p);
+    { const char *c = getenv("DM_ROMFS_CONTAINER"); if (c && *c) setenv("DM_ROMFS", c, 1); }   // a single-file RomFS: the host reads it as the RomFS
 #ifdef DM_RELEASE
     unsetenv("DM_CTL");   // a release build takes no remote key presses (the control file is a development tool)
 #endif
@@ -1377,10 +1402,10 @@ __attribute__((visibility("default"))) void ANativeActivity_onCreate(ANativeActi
     { pthread_t w; if (!pthread_create(&w, NULL, pad_watch, act->vm)) pthread_detach(w); }
     { pthread_t w; if (!pthread_create(&w, NULL, temp_watch, act->vm)) pthread_detach(w); }
     LOG("NX2A host on Android: files %s, RomFS %s, saves %s", g_root, getenv("DM_ROMFS"), act->internalDataPath);
-    if (atomic_load(&g_start_screen) || atomic_load(&g_romfs_missing)) { dm_overlay_redraw(); return; }   // the start screen: the host starts from its Start game row
-    start_host();
+    start_host();   // the host starts held when the start screen is on: its present thread draws the screen and its input thread drives it
 }
 static void start_host(void) {
+    atomic_store(&g_running, 1);
     pthread_t t; pthread_create(&t, NULL, input_thread, NULL); pthread_detach(t);
     // The game's main thread: a 16 MB stack mapped here and handed over whole (pthread_attr_setstack), so the range pthread_getattr_np reports, which
     // svcQueryMemory gives the game as its main thread stack (hle_svc.c), is exactly mapped memory: IL2CPP's garbage collector scans that range from
@@ -1391,4 +1416,5 @@ static void start_host(void) {
     if (stk != MAP_FAILED) { mprotect(stk, guard, PROT_NONE); pthread_attr_setstack(&at, stk + guard, ssz); } else pthread_attr_setstacksize(&at, ssz);
     if (pthread_create(&t, &at, host_thread, NULL)) LOG("[RED] cannot start the host thread"); else pthread_detach(t);
     pthread_attr_destroy(&at);
+    if (atomic_load(&g_start_screen) || atomic_load(&g_romfs_missing)) hold_sync();   // the start screen holds the game
 }

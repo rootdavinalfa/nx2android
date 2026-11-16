@@ -128,13 +128,18 @@ static int export_to(const char *base, const char *suffix, char *name, int cap, 
 int dm_saves_export(const char *suffix, char *name, int cap, char *err, int ecap) { return export_to(g_dir, suffix, name, cap, err, ecap); }
 int dm_saves_export_to(const char *dest, char *name, int cap, char *err, int ecap) { return export_to(dest, "", name, cap, err, ecap); }
 int dm_saves_import_from(const char *src, char *name, int cap, char *err, int ecap) {   // a folder the player picked: its files at the top, as a console's save tools copy them
-    const char *b = strrchr(src, '/'); b = b ? b + 1 : src;
+    char clean[700]; snprintf(clean, sizeof clean, "%s", src);
+    size_t L = strlen(clean); while (L > 1 && clean[L - 1] == '/') clean[--L] = 0;   // a trailing slash is natural to type: it must not name saves/ itself
+    const char *b = strrchr(clean, '/'); b = b ? b + 1 : clean;
+    if (!*b || !strcmp(b, ".") || !strcmp(b, "..")) { snprintf(err, (size_t)ecap, "not a save folder: %s", src); return -EINVAL; }
     snprintf(name, (size_t)cap, "%s", b);
-    char dst[700]; snprintf(dst, sizeof dst, "%s/%s", g_dir, name);
-    rm_tree(dst);
+    char dst[700], tmp[720]; snprintf(dst, sizeof dst, "%s/%s", g_dir, name); snprintf(tmp, sizeof tmp, "%s.part", dst);
+    rm_tree(tmp);
     long files = 0; long long bytes = 0;
-    int r = dm_copy_tree(src, dst, &files, &bytes, err, ecap);
-    if (r) { rm_tree(dst); return r; }
+    int r = dm_copy_tree(clean, tmp, &files, &bytes, err, ecap);
+    if (r) { rm_tree(tmp); return r; }   // the source is not usable: the export of the same name stays
+    rm_tree(dst);
+    if (rename(tmp, dst)) { r = -errno; snprintf(err, (size_t)ecap, "%s", dst); rm_tree(tmp); return r; }
     return dm_saves_request_import(name);
 }
 

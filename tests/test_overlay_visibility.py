@@ -53,7 +53,7 @@ static void save_export(void) {}
 static void menu_audio(void) {}
 static void menu_close(void) {}
 static void dm_overlay_redraw(void) {}
-static _Atomic int g_start_screen, g_start_hi, g_running;
+static _Atomic int g_start_screen, g_start_hi, g_start_from_menu;
 static void start_touch(void *e, float W, float H) { (void)e; (void)W; (void)H; }
 static void start_key(uint64_t bit) { (void)bit; }
 ''' + visible + hidden + hit + menu + r'''
