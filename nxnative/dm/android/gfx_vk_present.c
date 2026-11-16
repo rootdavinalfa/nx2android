@@ -498,6 +498,7 @@ static void start_panel(const ov_canvas *cv, int st) {
     int is = (int)fmaxf(1, roundf(rh * 0.30f / PF_CAP));
     cv_rrect(cv, 0, 0, p[2], p[3], rh * 0.18f, C_BG);
     for (int row = 0; row < START_N; row++) {
+        if (row == START_RETRY && !missing) continue;   // the retry row only when the RomFS is missing
         ov_menu_rowrect(p, row, r); float cy = r[1] + rh / 2;
         if (row == sel) cv_rrect(cv, r[0], r[1] + rh * 0.08f, r[0] + rw, r[1] + rh * 0.92f, rh * 0.14f, C_HI);
         const char *label = row == START_GAME && running ? "Back to game" : START_LABELS[row];
