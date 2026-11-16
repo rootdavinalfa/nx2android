@@ -374,7 +374,7 @@ static void cv_button(const ov_canvas *cv, const float b[4], const char *l, int 
 }
 // The pause menu (overlay_layout.h: the rows, the tabs, the slider's track), in the raster's panel rectangle. Its letters are as large as a row allows (0.30 of
 // its height, about 2.7 mm on a 6.7" phone and 3.6 mm on the 8.8" tablet) and smaller only when the widest row would not fit beside its control
-static const char *const OVM_LABELS[OVM_N] = {"Show gamepad", "Opacity", "Edit layout", "Rumble", "Show FPS", "Mode", "Export save", "Import save", "Face buttons", "Audio output", "Resume", ""};
+static const char *const OVM_LABELS[OVM_N] = {"Show gamepad", "Opacity", "Edit layout", "Rumble", "Show FPS", "Mode", "Export save", "Import save", "Face buttons", "Audio output", "Start screen", "Resume", ""};
 static const char *const OVM_BUTTONS[OVM_N] = {[OVM_EDIT] = "Edit", [OVM_EXPORT] = "Export", [OVM_IMPORT] = "Import", [OVM_AUDIO] = "Select"};   // the rows that are a button: its word
 static const char *const OVM_MODES[2] = {"Handheld", "Docked"};
 static const char *const OVM_PADS[2] = {"Position", "Label"};   // a controller's face buttons (front_android.c pad_labels)
@@ -489,12 +489,35 @@ static void ov_save_panel(const ov_canvas *cv, int st) {
         if (q->style == OVS_TITLE) cv_rrect(cv, r[0], r[1] + rh - 1, r[0] + rw, r[1] + rh, 0.5f, C_LINE);
     }
 }
+// The start screen (overlay_layout.h START_*): the game's start, the skip switch, and the missing-RomFS notice. It reuses the pause menu's panel rectangle and
+// row geometry; the notice is the last line.
+static void start_panel(const ov_canvas *cv, int st) {
+    float p[4] = {0, 0, (float)cv->w, (float)cv->h}, r[4]; ov_menu_rowrect(p, 0, r);
+    float rh = r[3], rw = r[2];
+    int sel = (st >> 4 & 15) - 1, missing = st >> 8 & 1, running = st >> 9 & 1;
+    int is = (int)fmaxf(1, roundf(rh * 0.30f / PF_CAP));
+    cv_rrect(cv, 0, 0, p[2], p[3], rh * 0.18f, C_BG);
+    for (int row = 0; row < START_N; row++) {
+        ov_menu_rowrect(p, row, r); float cy = r[1] + rh / 2;
+        if (row == sel) cv_rrect(cv, r[0], r[1] + rh * 0.08f, r[0] + rw, r[1] + rh * 0.92f, rh * 0.14f, C_HI);
+        const char *label = row == START_GAME && running ? "Back to game" : START_LABELS[row];
+        cv_text(cv, r[0] + rh * 0.15f, cy, label, is, row == sel ? C_WHITE : C_DIM);
+    }
+    if (running) {   // opened from the pause menu: the game is held, save first
+        ov_menu_rowrect(p, START_N, r); float cy = r[1] + rh / 2;
+        cv_text(cv, r[0] + rh * 0.15f, cy, "Save your game first: the game is held", is, C_ACCENT);
+    } else if (missing) {   // the notice: the RomFS is not there
+        ov_menu_rowrect(p, START_N, r); float cy = r[1] + rh / 2;
+        cv_text(cv, r[0] + rh * 0.15f, cy, "RomFS not found: copy/push it first", is, C_ACCENT);
+    }
+}
 static void ov_panel(int st) {   // the pause menu, the text entry or the layout editor, for menu state st (dm_menu_state), into the panel's rows of the upload buffer
     ov_canvas cv = {g_ov.px, g_ov.w, 0, g_ov.h + g_ov.sh, g_ov.pw, g_ov.ph};
     for (uint32_t y = 0; y < g_ov.ph; y++) memset(g_ov.px + 4 * ((size_t)(cv.y0 + y) * g_ov.w), 0, (size_t)g_ov.pw * 4);
     if (st >> 16 & 1) ov_text_panel(&cv);   // a text entry is open (dm_menu_state)
     else if (st & OVE_ST) ov_edit_panel(&cv, st, (float)g_sext.width, (float)g_sext.height);
     else if (st & OVS_ST) ov_save_panel(&cv, st);
+    else if (st & START_ST) start_panel(&cv, st);
     else ov_menu_panel(&cv, st);
 }
 // The phone window uses the same menu raster as Vulkan, independently of the external swapchain.
@@ -511,6 +534,7 @@ JNIEXPORT jintArray JNICALL Java_org_nx2a_ExternalActivity_externalMenuPixels(JN
     if (st & 0x10000) ov_text_panel(&cv);
     else if (st & OVE_ST) ov_edit_panel(&cv, st, (float)W, (float)H);
     else if (st & OVS_ST) ov_save_panel(&cv, st);
+    else if (st & START_ST) start_panel(&cv, st);
     else ov_menu_panel(&cv, st);
     size_t count = (size_t)w * h; jint *argb = malloc((count + 2) * sizeof *argb);
     if (!argb) { free(pixels); return NULL; }

@@ -74,10 +74,12 @@ JNIEXPORT void JNICALL Java_org_nx2a_ExternalActivity_externalSurface(JNIEnv *en
 void dm_focus_set(int st); void dm_audio_suspend(int on); void guest_clock_freeze_for(int reason, int on); void dm_gfx_suspend(int on);
 // ---- settings (the pause menu's), kept in the files folder as KEY=VALUE lines ----
 static char g_root[512];
+static int g_sdk;   // the device's SDK level (ANativeActivity_onCreate): the start screen's Retry re-checks the RomFS with it
 static _Atomic int g_set_overlay = 1, g_set_rumble = 1, g_set_fps;   // the gamepad shown; rumble and tap vibration; the frame rate counter (top left)
 static _Atomic int g_set_opacity = 60;   // the gamepad's opacity, percent (OV_OPACITY_MIN..MAX: the menu's Opacity slider)
 static _Atomic int g_set_grid;   // the layout editor's Snap to grid
 static _Atomic int g_set_labels = -1;   // a controller's face buttons by their label (1) or their position (0); -1: as env.txt says (pad_labels)
+static _Atomic int g_start_screen = 1, g_start_hi, g_romfs_missing;   // the start screen (settings.txt start_screen=), its highlighted row, the missing-RomFS notice
 // the player's own layout (overlay_layout.h dm_overlay_custom): [0] the saved one (settings.txt ui= rows), [1] the layout editor's while it is open; per layout
 // and control: x + 1, y + 1 in 1/10000 of the window's width and height (0 = the layout's place), the size factor in 1/1000 (0 = 1), 1 when hidden
 #define CUST_K 4
@@ -94,6 +96,7 @@ static void settings_load(void) {
         else if (sscanf(line, "opacity=%d", &v) == 1) atomic_store(&g_set_opacity, v < OV_OPACITY_MIN ? OV_OPACITY_MIN : v > OV_OPACITY_MAX ? OV_OPACITY_MAX : v);
         else if (sscanf(line, "grid=%d", &v) == 1) atomic_store(&g_set_grid, v != 0);
         else if (sscanf(line, "labels=%d", &v) == 1) atomic_store(&g_set_labels, v != 0);
+        else if (sscanf(line, "start_screen=%d", &v) == 1) atomic_store(&g_start_screen, v != 0);
         else if (!strncmp(line, "ui=", 3)) {   // ui=<layout>,<control>,<x>,<y>,<size>[,<hidden>]: x, y in 1/10000 of the window (-1 the layout's place), size in 1/1000
             char lay[16], name[32]; int x, y, z, hid = 0, l, i;
             if (sscanf(line + 3, "%15[^,],%31[^,],%d,%d,%d,%d", lay, name, &x, &y, &z, &hid) < 5 || (i = ctl_named(name)) < 0) continue;
@@ -110,8 +113,8 @@ static void settings_load(void) {
 static void settings_save(void) {
     char p[600], tmp[610]; snprintf(p, sizeof p, "%s/settings.txt", g_root); snprintf(tmp, sizeof tmp, "%s.new", p);
     FILE *f = fopen(tmp, "w"); if (!f) { LOG("[RED] cannot write %s", tmp); return; }
-    fprintf(f, "overlay=%d\nrumble=%d\ndocked=%d\nfps=%d\nopacity=%d\ngrid=%d\n", atomic_load(&g_set_overlay), atomic_load(&g_set_rumble), dm_opmode() != 0, atomic_load(&g_set_fps),
-            atomic_load(&g_set_opacity), atomic_load(&g_set_grid));
+    fprintf(f, "overlay=%d\nrumble=%d\ndocked=%d\nfps=%d\nopacity=%d\ngrid=%d\nstart_screen=%d\n", atomic_load(&g_set_overlay), atomic_load(&g_set_rumble), dm_opmode() != 0, atomic_load(&g_set_fps),
+            atomic_load(&g_set_opacity), atomic_load(&g_set_grid), atomic_load(&g_start_screen));
     if (atomic_load(&g_set_labels) >= 0) fprintf(f, "labels=%d\n", atomic_load(&g_set_labels));   // (only once the player chose: until then env.txt decides)
     for (int l = 0; l < 2; l++) for (int i = 0; i < OV_N; i++) {
         _Atomic int *c = g_cust[0][l][i]; int x = atomic_load(&c[0]), y = atomic_load(&c[1]), z = atomic_load(&c[2]), hid = atomic_load(&c[3]);
@@ -131,7 +134,7 @@ static _Atomic int g_ime_on;
 static _Atomic int g_tx_on;   // text entry open (front_text_input): the game is held as by the menu
 static void hold_sync(void) {
     pthread_mutex_lock(&g_hold_mu);
-    int want = atomic_load(&g_bg) || atomic_load(&g_menu) || atomic_load(&g_tx_on) || atomic_load(&g_ime_on);
+    int want = atomic_load(&g_bg) || atomic_load(&g_menu) || atomic_load(&g_tx_on) || atomic_load(&g_ime_on) || (atomic_load(&g_start_screen) && atomic_load(&g_running));
     if (want != g_held) { g_held = want; if (want) { dm_movie_hold(1); dm_audio_suspend(1); guest_clock_freeze_for(1, 1); } else { guest_clock_freeze_for(1, 0); dm_audio_suspend(0); dm_movie_hold(0); } }
     pthread_mutex_unlock(&g_hold_mu);
 }
@@ -488,6 +491,7 @@ static _Atomic int g_ed_st;    // the layout editor's state for dm_menu_state (o
 static _Atomic int g_sp_on, g_sp_hi = -1, g_sp_ver;   // the save picker (below): open, its highlighted row, its edit count
 static _Atomic int g_sv_st, g_sv_n;                   // Export save: its outcome (overlay_layout.h OVX_*), the exports made
 int dm_menu_state(void) {
+    if (atomic_load(&g_start_screen)) return START_ST | (atomic_load(&g_start_hi) + 1) << 4 | (atomic_load(&g_romfs_missing) ? 1 : 0) << 8 | (atomic_load(&g_running) ? 1 : 0) << 9;
     if (atomic_load(&g_tx_on)) return 1 << 16 | (atomic_load(&g_tx_ver) & 0xffff);   // the text entry's panel (gfx_vk_present.c ov_text_panel)
     if (!atomic_load(&g_menu)) return -1;
     if (atomic_load(&g_edit)) return OVE_ST | atomic_load(&g_ed_st);
@@ -548,8 +552,33 @@ static void menu_do(int item) {
     else if (item == OVM_EXPORT) { if (atomic_load(&g_sv_st) == OVX_BUSY) return; save_export(); }
     else if (item == OVM_IMPORT) { dm_haptics_android_tap(); sp_open(); return; }
     else if (item == OVM_AUDIO) { menu_audio(); }
+    else if (item == OVM_START) { atomic_store(&g_start_screen, 1); atomic_store(&g_start_hi, 0); menu_close(); dm_overlay_redraw(); return; }
     if (item >= 0 && item < OVM_N) dm_haptics_android_tap();
     if (item == OVM_RESUME) menu_close(); else dm_overlay_redraw();
+}
+// ---- the start screen (overlay_layout.h START_*): the game starts from here, and the skip switch keeps it from showing again ----
+static void start_host(void);
+static int romfs_readable(ANativeActivity *act, int sdk);
+static void start_screen_do(int item) {
+    if (item == START_RETRY) {   // the RomFS was missing: check it again before starting
+        if (!romfs_readable(g_act, g_sdk)) { dm_overlay_redraw(); return; }
+        atomic_store(&g_romfs_missing, 0);
+    }
+    if (atomic_load(&g_running)) { atomic_store(&g_start_screen, 0); dm_overlay_redraw(); return; }   // opened from the pause menu: back to the game
+    if (item == START_SKIP) { atomic_store(&g_start_screen, 0); settings_save(); }
+    else atomic_store(&g_start_screen, 0);
+    dm_haptics_android_tap(); start_host();
+}
+static void start_touch(AInputEvent *e, float W, float H) {
+    if ((AMotionEvent_getAction(e) & AMOTION_EVENT_ACTION_MASK) != AMOTION_EVENT_ACTION_UP) return;
+    int row = ov_menu_row_at(AMotionEvent_getX(e, 0), AMotionEvent_getY(e, 0), W, H);
+    if (row >= 0 && row < START_N) start_screen_do(row);
+}
+static void start_key(uint64_t bit) {
+    int hi = atomic_load(&g_start_hi);
+    if (bit == DM_BTN_UP || bit == DM_BTN_DOWN) { hi = (hi + (bit == DM_BTN_UP ? START_N - 1 : 1)) % START_N; atomic_store(&g_start_hi, hi); dm_overlay_redraw(); }
+    else if (bit == DM_BTN_A) start_screen_do(hi);
+    else if (bit == DM_BTN_B || bit == DM_BTN_PLUS) start_screen_do(START_GAME);
 }
 static void menu_touch(AInputEvent *e, float W, float H) {   // a press on a row does it when it lifts there; a tap outside the panel or on the menu button closes
     int act = AMotionEvent_getAction(e) & AMOTION_EVENT_ACTION_MASK, ai = AMotionEvent_getAction(e) >> AMOTION_EVENT_ACTION_POINTER_INDEX_SHIFT;
@@ -932,6 +961,7 @@ __attribute__((weak)) void dm_picture_rect(float r[4]);   // gfx_vk_present.c
 static void touch_event(AInputEvent *e) {
     ANativeWindow *w = phone_window(); float W = w ? (float)ANativeWindow_getWidth(w) : 1, H = w ? (float)ANativeWindow_getHeight(w) : 1;
     if (atomic_load(&g_tx_on)) { tx_touch(e, W, H); return; }   // the text entry's keys
+    if (atomic_load(&g_start_screen) && !atomic_load(&g_running)) { start_touch(e, W, H); return; }
     if (atomic_load(&g_menu)) { if (atomic_load(&g_edit)) ed_touch(e, W, H); else if (atomic_load(&g_sp_on)) sp_touch(e, W, H); else menu_touch(e, W, H); return; }
     int act = AMotionEvent_getAction(e) & AMOTION_EVENT_ACTION_MASK, ai = AMotionEvent_getAction(e) >> AMOTION_EVENT_ACTION_POINTER_INDEX_SHIFT;
     size_t pc = AMotionEvent_getPointerCount(e);
@@ -1009,6 +1039,7 @@ static int handle_event(AInputEvent *e) {
             return 0;
         }
         if (down) pad_mark_used(AInputEvent_getDeviceId(e));   // a release after a touch must not hide the controls again
+        if (atomic_load(&g_start_screen) && !atomic_load(&g_running)) { if (down && AKeyEvent_getRepeatCount(e) == 0) start_key(bit); return 1; }
         if (atomic_load(&g_menu)) { if (down && AKeyEvent_getRepeatCount(e) == 0) menu_key(bit); return 1; }
         if (down) g_btn |= bit; else if (AKeyEvent_getAction(e) == AKEY_EVENT_ACTION_UP) g_btn &= ~bit;
         dm_pad_players(1); pad_publish(); return 1;
@@ -1177,7 +1208,8 @@ static void *input_thread(void *a) {
         int toggle = atomic_exchange(&g_ext_menu, 0);
         if (toggle & 1) { if (atomic_load(&g_menu)) menu_close(); else menu_open(0); }
         uint64_t b = atomic_load(&g_ext_buttons), presses = atomic_exchange(&g_ext_presses, 0);
-        if (atomic_load(&g_menu)) { uint64_t down = (b & ~prev) | presses; latched = 0; for (int i = 0; i < 16; i++) if (down & (1ull << i)) menu_key(1ull << i); dm_input_set(0, 0, 0, 0, 0); }
+        if (atomic_load(&g_start_screen) && !atomic_load(&g_running)) { uint64_t down = (b & ~prev) | presses; latched = 0; for (int i = 0; i < 16; i++) if (down & (1ull << i)) start_key(1ull << i); dm_input_set(0, 0, 0, 0, 0); }
+        else if (atomic_load(&g_menu)) { uint64_t down = (b & ~prev) | presses; latched = 0; for (int i = 0; i < 16; i++) if (down & (1ull << i)) menu_key(1ull << i); dm_input_set(0, 0, 0, 0, 0); }
         else {
             int64_t elapsed = mono_ns() - since;
             if (latched && ((elapsed >= 20000000 && dm_input_samples() != sample) || elapsed >= 100000000)) latched = 0;
@@ -1289,11 +1321,16 @@ __attribute__((visibility("default"))) void ANativeActivity_onCreate(ANativeActi
 #endif
     // the save manager's requests (saves_android.c), before the host mounts the save: an import chosen in the menu or pushed by porter, an export porter asks for
     if (dm_saves_start(g_root)) { LOG("[saves] the request asked the app to end: the game is not started"); g_quit = 1; return; }
-    if (!romfs_readable(act, sdk)) { g_quit = 1; return; }   // after the save manager's requests, which need no RomFS
+    g_sdk = sdk;
+    if (!romfs_readable(act, sdk)) atomic_store(&g_romfs_missing, 1);   // the start screen says the RomFS is missing and offers Retry
     settings_load(); dm_haptics_android_start(act, atomic_load(&g_set_rumble)); dm_lan_android_start(act);
     { pthread_t w; if (!pthread_create(&w, NULL, pad_watch, act->vm)) pthread_detach(w); }
     { pthread_t w; if (!pthread_create(&w, NULL, temp_watch, act->vm)) pthread_detach(w); }
     LOG("NX2A host on Android: files %s, RomFS %s, saves %s", g_root, getenv("DM_ROMFS"), act->internalDataPath);
+    if (atomic_load(&g_start_screen) || atomic_load(&g_romfs_missing)) { dm_overlay_redraw(); return; }   // the start screen: the host starts from its Start game row
+    start_host();
+}
+static void start_host(void) {
     pthread_t t; pthread_create(&t, NULL, input_thread, NULL); pthread_detach(t);
     // The game's main thread: a 16 MB stack mapped here and handed over whole (pthread_attr_setstack), so the range pthread_getattr_np reports, which
     // svcQueryMemory gives the game as its main thread stack (hle_svc.c), is exactly mapped memory: IL2CPP's garbage collector scans that range from
