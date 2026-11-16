@@ -52,6 +52,8 @@ class Options:
     alias_headroom: int = None         # GB more alias region (alias_headroom); None: ALIAS_HEADROOM for a version the profile was not brought up on, none for one it was
     romfs_at: str = None               # with install: the folder on the device the app reads the RomFS from (porter/install.py), 'app' for its files folder; None: as the device has it
     romfs_push: bool = False           # with romfs_at: push the pack's RomFS into that folder first
+    container_at: str = None           # with install: the file on the device the app reads its single-file RomFS from (porter/install.py); overrides romfs_at
+    container_push: bool = False       # with container_at: push the pack's container there (the default)
     jobs: int = field(default_factory=lambda: os.cpu_count() or 8)
 
 
@@ -877,7 +879,7 @@ class Port:
     # ---- install (optional) ----
     def install(self):
         install.install(self.apk_path, self.data_path, self.tools['adb'], self.o.device or self.cfg.get('device'), replace_signer=self.o.replace_signer,
-                        romfs_at=self.o.romfs_at, romfs_push=self.o.romfs_push)
+                        romfs_at=self.o.romfs_at, romfs_push=self.o.romfs_push, container_at=self.o.container_at, container_push=self.o.container_push)
 
 
 def emit_result(r):   # the last JSON event of a port (the GUI's done screen); a summary line in the other modes

@@ -92,6 +92,9 @@ def _romfs_at(p, when=''):   # install's --romfs-at / --romfs-push (porter/insta
                         'instead of a copy in the app\'s files folder: the folder must hold exactly the pack\'s RomFS (names and sizes, and the content of a sample), the app is given All files access, '
                         'and a copy an earlier install left in the files folder is deleted. Later installs keep the folder; "app" moves the RomFS back into the files folder')
     p.add_argument('--romfs-push', action='store_true', help='with --romfs-at: push the pack\'s RomFS into that folder first (an empty folder, or one of this game; nothing there is deleted)')
+    p.add_argument('--container-at', default=None, metavar='FILE',
+                   help=when + 'read the game\'s RomFS from this single-file container on the device (a pack made with android.tsv romfs container), pushed there; it overrides --romfs-at')
+    p.add_argument('--container-push', action='store_true', help='with --container-at: push the pack\'s container there (the default; kept for symmetry with --romfs-push)')
 
 
 def _print_json(obj): print(json.dumps(obj, ensure_ascii=False, indent=2))
@@ -163,14 +166,14 @@ def cmd_port(a):
         env = os.environ.get('NX2A_VERCODE_OFFSET', '').strip() or '0'
         try: offset = int(env)
         except ValueError: print(f'NX2A_VERCODE_OFFSET is not a number: {env}', file=sys.stderr); return 2
-    if (a.romfs_at is not None or a.romfs_push) and not a.install: print('--romfs-at and --romfs-push are install options: add --install, or run porter install after the port', file=sys.stderr); return 2
+    if (a.romfs_at is not None or a.romfs_push or a.container_at is not None or a.container_push) and not a.install: print('--romfs-at, --romfs-push, --container-at and --container-push are install options: add --install, or run porter install after the port', file=sys.stderr); return 2
     from porter import install
     from porter.upstream import BuildError
-    try: install.romfs_target(a.romfs_at)   # a folder the app cannot read fails now, not after the shaders
+    try: install.romfs_target(a.romfs_at); install.container_target(a.container_at)   # a folder or file the app cannot read fails now, not after the shaders
     except BuildError as e: print(e, file=sys.stderr); return 2
     opts = pipeline.Options(folder=Path(a.folder), keys=Path(a.keys) if a.keys else None, firmware=Path(a.firmware) if a.firmware else None, out=Path(a.out) if a.out else None, version=a.version, language=a.language,
                             app_name=a.app_name, install=a.install, device=a.device, replace_signer=a.replace_signer, debug=a.debug, experimental=a.experimental, package=a.package, fps60=a.fps60, touch=a.touch, mt_replay=a.mt_replay, vulkan_driver=a.vulkan_driver, shared_font=a.shared_font,
-                            vercode_offset=offset, alias_headroom=a.alias_headroom, romfs_at=a.romfs_at, romfs_push=a.romfs_push, external_display=a.external_display, native_keyboard=a.native_keyboard, jobs=a.jobs)
+                            vercode_offset=offset, alias_headroom=a.alias_headroom, romfs_at=a.romfs_at, romfs_push=a.romfs_push, container_at=a.container_at, container_push=a.container_push, external_display=a.external_display, native_keyboard=a.native_keyboard, jobs=a.jobs)
     return _with_progress(a.progress, lambda: pipeline.emit_result(pipeline.Port(opts).run()))
 
 
@@ -182,7 +185,7 @@ def cmd_install(a):
         apk = Path(a.apk) if a.apk else data.with_name(data.name.removesuffix('-data') + '.apk')
         PROG.plan(1)
         cfg = config.load()
-        install.install(apk, data, toolchain.find_adb(cfg), a.device or cfg.get('device'), replace_signer=a.replace_signer, romfs_at=a.romfs_at, romfs_push=a.romfs_push)
+        install.install(apk, data, toolchain.find_adb(cfg), a.device or cfg.get('device'), replace_signer=a.replace_signer, romfs_at=a.romfs_at, romfs_push=a.romfs_push, container_at=a.container_at, container_push=a.container_push)
     return _with_progress(a.progress, go)
 
 

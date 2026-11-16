@@ -260,5 +260,29 @@ class Hold(unittest.TestCase):
         self.assertIsNotNone(got[0]); got[0].close()
 
 
+class ContainerAt(unittest.TestCase):
+    def setUp(self):
+        self.t = Path(tempfile.mkdtemp(prefix='nx2a_test_container_install_')); self.real, PROG.mode = install.Adb, 'off'
+        d = self.data = self.t / 'Test-data'
+        (d / 'mods').mkdir(parents=True); (d / 'mods/main').write_bytes(b'x' * 10)
+        (d / 'shaders.dmsv').write_bytes(b'x' * 4)
+        (self.t / 'romfs/Data').mkdir(parents=True); (self.t / 'romfs/Data/a.bin').write_bytes(b'y' * 20)
+        from porter import romfs_container
+        romfs_container.pack(self.t / 'romfs', d / 'romfs.nxz')
+        (d / 'env.txt').write_text('# porter\nDM_LANG=en-US\nDM_ROMFS_CONTAINER=/sdcard/Android/data/org.nx2a.test/files/romfs.nxz\n', encoding='utf-8')
+        (d / datapack.MANIFEST).write_text(json.dumps(dict(title_id='0100000000AAA000', name='Test Game', package=PKG, version='v65536', display='1.1.0', requires=[], bytes=sum(p.stat().st_size for p in d.rglob('*') if p.is_file()))))
+        self.apk = apk_file(self.t / 'Test.apk')
+
+    def tearDown(self): install.Adb = self.real; shutil.rmtree(self.t, ignore_errors=True)
+
+    def test_container_at_pushes_one_file_and_writes_env(self):
+        dev = Device()
+        install.Adb = lambda exe, serial=None, log=print: dev
+        install.install(self.apk, self.data, 'adb', container_at='/sdcard/Games/Test/romfs.nxz')
+        self.assertNotEqual(dev.step('push_file', '/sdcard/Games/Test/romfs.nxz'), -1)
+        self.assertEqual(dev.step('push_tree', 'RomFS'), -1)
+        self.assertIn('DM_ROMFS_CONTAINER=/sdcard/Games/Test/romfs.nxz', dev.text[f'{FILES}/env.txt'])
+
+
 if __name__ == '__main__':
     unittest.main()

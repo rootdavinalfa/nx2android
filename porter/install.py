@@ -53,6 +53,33 @@ def env_with_romfs(pack_env, folder):   # the pack's env.txt with the installer'
     return pack_env.rstrip('\n') + f'\n{ROMFS_MARK}: the game\'s RomFS is read from this folder (later installs keep it; --romfs-at app moves it into the files folder)\nDM_ROMFS={folder}\n'
 
 
+CONTAINER_MARK = '# porter install --container-at'   # in the device's env.txt: the DM_ROMFS_CONTAINER row under it is the installer's, carried over by later installs
+
+
+def container_target(arg):
+    """--container-at's file, checked before anything touches the device: an absolute path in shared storage"""
+    if arg is None: return None
+    if arg != arg.strip() or any(c in arg for c in '\r\n\0') or not arg.startswith('/'):
+        raise BuildError(f'--container-at takes a file on the device as an absolute path (/sdcard/…, /storage/…): {arg!r}')
+    d = posixpath.normpath(arg)
+    if not d.startswith(('/sdcard/', '/storage/')): raise BuildError(f'--container-at {d}: the app can read only shared storage, /sdcard/… or /storage/… (an SD card: /storage/<its id>/…)')
+    if re.search(r'/Android/(data|obb)(/|$)', d, re.I):
+        raise BuildError(f'--container-at {d}: Android lets no app read a file under another app\'s Android/data or Android/obb, even with All files access: move it elsewhere (/sdcard/Games/…)')
+    if len(d.encode()) > 512: raise BuildError(f'--container-at: a path of at most 512 bytes (the host\'s path buffers): {d}')
+    return d
+
+
+def device_container(env_text):   # the file an earlier --container-at install wrote into the device's env.txt, None when there is none
+    lines, out = env_text.splitlines(), None
+    for prev, ln in zip([''] + lines, lines):
+        if prev.startswith(CONTAINER_MARK) and ln.startswith('DM_ROMFS_CONTAINER='): out = ln[len('DM_ROMFS_CONTAINER='):].rstrip() or None
+    return out
+
+
+def env_with_container(pack_env, path):   # the pack's env.txt with the installer's row last: the app applies the rows in order (front_android.c env_file), so it wins
+    return pack_env.rstrip('\n') + f'\n{CONTAINER_MARK}: the game\'s RomFS container is read from this file (later installs keep it)\nDM_ROMFS_CONTAINER={path}\n'
+
+
 def romfs_diff(want, have):   # want, have: {path in the RomFS: size} → (missing, of another size, not the game's), each sorted
     return sorted(want.keys() - have.keys()), sorted(r for r in want.keys() & have.keys() if want[r] != have[r]), sorted(have.keys() - want.keys())
 
@@ -94,9 +121,10 @@ def apk_asks_access(apk):   # whether the APK asks for All files access: one mad
     return ACCESS.encode('utf-16-le') in m or ACCESS.encode() in m
 
 
-def install(apk, data, adb_exe, serial=None, replace_signer=False, romfs_at=None, romfs_push=False):
+def install(apk, data, adb_exe, serial=None, replace_signer=False, romfs_at=None, romfs_push=False, container_at=None, container_push=False):
     """romfs_at: a folder on the device that holds the game's RomFS (romfs_push: push the pack's RomFS into it first), 'app' for the app's files folder, None: as the
-    device has it (an earlier --romfs-at install's folder, else the files folder)"""
+    device has it (an earlier --romfs-at install's folder, else the files folder). container_at: a file on the device that holds the pack's single-file RomFS
+    (porter/romfs_container.py), pushed there and named in env.txt; it overrides romfs_at."""
     apk, data = Path(apk), Path(data)
     man = datapack.read_manifest(data)
     if not man: raise BuildError(f'not a data pack (no {datapack.MANIFEST}): {data}')
@@ -104,6 +132,11 @@ def install(apk, data, adb_exe, serial=None, replace_signer=False, romfs_at=None
     if not adb_exe: raise BuildError('adb not found: install Android platform-tools, or set its path with `porter config adb <path>`')
     files = datapack.files_folder(man['package'])
     target = romfs_target(romfs_at, files)
+    container = data / 'romfs.nxz'
+    container_path = container_target(container_at)
+    if container_path and not container.is_file():
+        raise BuildError(f'{data} has no romfs.nxz: port the game with android.tsv romfs container, or install without --container-at')
+    if container_path: target = None   # the RomFS is the container, not a folder
     if romfs_push and not target: raise BuildError('--romfs-push needs --romfs-at <a folder on the device outside the app\'s files folder>')
     packed = packed_romfs(data)
     if packed and target: raise BuildError(PACKED_ELSEWHERE)
@@ -119,7 +152,7 @@ def install(apk, data, adb_exe, serial=None, replace_signer=False, romfs_at=None
             if bc is False: raise BuildError(f'{man["name"]} needs BC-compressed textures, which this device\'s GPU ({adb.gpu()}) cannot read')
             if bc is None: say(f'[RED] {man["name"]} needs BC-compressed textures; whether this GPU ({adb.gpu() or "unknown"}) reads them is not known')
         was = device_romfs(adb.read_text(f'{files}/env.txt'))   # an earlier --romfs-at install's folder
-        if romfs_at is None and was:
+        if container_path is None and romfs_at is None and was:
             target = romfs_target(was, files)
             if packed and target: raise BuildError(f'the app reads its RomFS from {target} (an earlier install\'s --romfs-at). ' + PACKED_ELSEWHERE)
             if target: say(f'the app reads its RomFS from {target} (an earlier install\'s --romfs-at; --romfs-at app moves it into its files folder)')
@@ -172,9 +205,13 @@ def install(apk, data, adb_exe, serial=None, replace_signer=False, romfs_at=None
             say(f'{state}: the app reads its RomFS from {target}')
         PROG.set(step='pushing the game data', done=0, total=man['bytes'] - sum(rom.values()), unit='B'); pushing = True
         have = adb.remote_sizes(files)   # again: an install with --replace-signer uninstalls first, and Android deletes the files folder with the app
-        adb.push_tree(data, files, keep=datapack.KEEP_ON_DEVICE, skip=(datapack.MANIFEST,) + (('env.txt',) if target else ()), exclude=(datapack.ROMFS,) if target else (),
+        skip = (datapack.MANIFEST,) + (('env.txt',) if target else ()) + (('romfs.nxz',) if container_path else ())
+        adb.push_tree(data, files, keep=datapack.KEEP_ON_DEVICE, skip=skip, exclude=(datapack.ROMFS,) if target else (),
                       verify=lambda rel: rel.split('/', 1)[0] not in ('RomFS', 'aoc'),   # the game's own files change only with their version
                       progress=lambda d, t, note: PROG.set(done=d, total=t, note=note), have=have)
+        if container_path:   # the single-file RomFS, in resumable pieces, where the user asked for it
+            PROG.set(step=f'pushing the RomFS container to {container_path}', done=0, total=container.stat().st_size, unit='B')
+            adb.push_file(container, container_path, progress=lambda d, t, note: PROG.set(done=d, total=t, note=note))
         if target and (missing or other or changed):   # --romfs-push: the pack's RomFS into the folder (changed: pushed again when their MD5 differs), then the folder checked again
             PROG.set(step=f'pushing the RomFS into {target}', done=0, total=sum(rom[r] for r in missing + other + changed), unit='B')
             again = set(changed)
@@ -184,6 +221,10 @@ def install(apk, data, adb_exe, serial=None, replace_signer=False, romfs_at=None
         if target:   # the pack's env.txt with the installer's row
             with tempfile.TemporaryDirectory(prefix='nx2a_env_') as t:
                 env = Path(t) / 'env.txt'; env.write_text(env_with_romfs((data / 'env.txt').read_text(encoding='utf-8'), target), encoding='utf-8', newline='\n')
+                adb.push_file(env, f'{files}/env.txt')
+        elif container_path:   # the pack's env.txt with the installer's container row
+            with tempfile.TemporaryDirectory(prefix='nx2a_env_') as t:
+                env = Path(t) / 'env.txt'; env.write_text(env_with_container((data / 'env.txt').read_text(encoding='utf-8'), container_path), encoding='utf-8', newline='\n')
                 adb.push_file(env, f'{files}/env.txt')
         elif was and romfs_at == APP: say(f'the app reads its RomFS from its files folder again; {was} is left as it is')
         stale = [rel for rel in have if rel.split('/', 1)[0] in datapack.OWNED and not (target and rel.startswith(datapack.ROMFS + '/')) and not (data / rel).is_file()]   # the push only adds the pack's own files, which are never stale
