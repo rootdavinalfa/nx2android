@@ -54,6 +54,7 @@ class Options:
     romfs_push: bool = False           # with romfs_at: push the pack's RomFS into that folder first
     container_at: str = None           # with install: the file on the device the app reads its single-file RomFS from (porter/install.py); overrides romfs_at
     container_push: bool = False       # with container_at: push the pack's container there (the default)
+    container: bool = False            # pack the RomFS as one file (porter/romfs_container.py), overriding the profile's romfs key
     jobs: int = field(default_factory=lambda: os.cpu_count() or 8)
 
 
@@ -840,7 +841,7 @@ class Port:
             font_env, font_files = font_env + [f'DM_SHARED_FONT={datapack.files_folder(self.package)}/standard.ttf'], {**font_files, 'standard.ttf': self.o.shared_font}
         dst = self.o.out / f'{app_stem(self.g, self.app_name)}-data'
         romfs, zenv, container = self.game / 'RomFS', [], None
-        if self.ap.romfs_container and romfs.is_dir():   # android.tsv romfs container: the whole RomFS in one file, pushed in resumable pieces
+        if (self.o.container or self.ap.romfs_container) and romfs.is_dir():   # android.tsv romfs container (or --container): the whole RomFS in one file, pushed in resumable pieces
             PROG.set(step='packing the RomFS container', done=0, total=1, unit='B')
             container = self.aw / 'romfs.nxz'
             nf, size = romfs_container.pack(romfs, container, self.o.jobs, progress=lambda d, t: PROG.set(step='packing the RomFS container', done=d, total=t, unit='B'))

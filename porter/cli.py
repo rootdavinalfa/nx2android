@@ -50,6 +50,7 @@ def _parser():
                          '"AllocateAddressRegion refused (0x1803)" before it crashes; it uses no memory (default: 8 for a game version the profile was not '
                          'brought up on, none for one it was)')
     _romfs_at(po, 'with --install: ')
+    po.add_argument('--container', action='store_true', help='pack the RomFS as one file (porter/romfs_container.py) instead of a folder: the installer pushes one resumable file')
     po.add_argument('--jobs', type=int, default=os.cpu_count() or 8)
     po.add_argument('--progress', default='auto', choices=('auto', 'bar', 'lines', 'json', 'off'), help='json: one JSON event per line, for the GUI')
     ins = sub.add_parser('install', help='install a port made earlier'); ins.add_argument('data', help='the data pack folder (<App>-data)'); ins.add_argument('--apk', help='the APK (default: <App>.apk beside the pack)')
@@ -173,7 +174,7 @@ def cmd_port(a):
     except BuildError as e: print(e, file=sys.stderr); return 2
     opts = pipeline.Options(folder=Path(a.folder), keys=Path(a.keys) if a.keys else None, firmware=Path(a.firmware) if a.firmware else None, out=Path(a.out) if a.out else None, version=a.version, language=a.language,
                             app_name=a.app_name, install=a.install, device=a.device, replace_signer=a.replace_signer, debug=a.debug, experimental=a.experimental, package=a.package, fps60=a.fps60, touch=a.touch, mt_replay=a.mt_replay, vulkan_driver=a.vulkan_driver, shared_font=a.shared_font,
-                            vercode_offset=offset, alias_headroom=a.alias_headroom, romfs_at=a.romfs_at, romfs_push=a.romfs_push, container_at=a.container_at, container_push=a.container_push, external_display=a.external_display, native_keyboard=a.native_keyboard, jobs=a.jobs)
+                            vercode_offset=offset, alias_headroom=a.alias_headroom, romfs_at=a.romfs_at, romfs_push=a.romfs_push, container_at=a.container_at, container_push=a.container_push, container=a.container, external_display=a.external_display, native_keyboard=a.native_keyboard, jobs=a.jobs)
     return _with_progress(a.progress, lambda: pipeline.emit_result(pipeline.Port(opts).run()))
 
 
