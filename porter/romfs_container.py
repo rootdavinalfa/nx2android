@@ -48,7 +48,8 @@ def pack(src, dst, jobs=8, progress=None):
     src, dst = Path(src), Path(dst)
     files = sorted(p for p in src.rglob('*') if p.is_file())
     total = sum(p.stat().st_size for p in files); done = 0; entries = []
-    with open(dst, 'wb') as out:
+    tmp = dst.with_name(dst.name + '.partial')   # a failed pack leaves no half container at dst
+    with open(tmp, 'wb') as out:
         out.write(b'\0' * HDR.size); data = HDR.size
         for p in files:
             rel = p.relative_to(src).as_posix()
@@ -59,6 +60,7 @@ def pack(src, dst, jobs=8, progress=None):
         for rel, raw, bs, n, table in entries:
             b = rel.encode('utf-8'); out.write(ENT.pack(len(b))); out.write(b); out.write(struct.pack('<QIIQ', raw, bs, n, table))
         out.seek(0); out.write(HDR.pack(MAGIC, VERSION, len(entries), index, data, 0))
+    tmp.replace(dst)
     return len(entries), dst.stat().st_size
 
 

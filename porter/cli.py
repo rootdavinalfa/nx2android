@@ -170,7 +170,7 @@ def cmd_port(a):
     if (a.romfs_at is not None or a.romfs_push or a.container_at is not None or a.container_push) and not a.install: print('--romfs-at, --romfs-push, --container-at and --container-push are install options: add --install, or run porter install after the port', file=sys.stderr); return 2
     from porter import install
     from porter.upstream import BuildError
-    try: install.romfs_target(a.romfs_at); install.container_target(a.container_at)   # a folder or file the app cannot read fails now, not after the shaders
+    try: install.romfs_target(a.romfs_at)   # a folder the app cannot read fails now, not after the shaders
     except BuildError as e: print(e, file=sys.stderr); return 2
     opts = pipeline.Options(folder=Path(a.folder), keys=Path(a.keys) if a.keys else None, firmware=Path(a.firmware) if a.firmware else None, out=Path(a.out) if a.out else None, version=a.version, language=a.language,
                             app_name=a.app_name, install=a.install, device=a.device, replace_signer=a.replace_signer, debug=a.debug, experimental=a.experimental, package=a.package, fps60=a.fps60, touch=a.touch, mt_replay=a.mt_replay, vulkan_driver=a.vulkan_driver, shared_font=a.shared_font,

@@ -291,6 +291,15 @@ class ContainerAt(unittest.TestCase):
         install.install(self.apk, self.data, 'adb')   # no --container-at: the earlier location is kept
         self.assertIn('DM_ROMFS_CONTAINER=/sdcard/Games/Test/romfs.nxz', dev.text[f'{FILES}/env.txt'])
 
+    def test_container_push_needs_container_at(self):
+        with self.assertRaisesRegex(BuildError, 'container-at'):
+            install.install(self.apk, self.data, 'adb', container_push=True)
+
+    def test_container_target_allows_the_apps_own_files_folder(self):
+        self.assertEqual(install.container_target(f'{FILES}/romfs.nxz', FILES), f'{FILES}/romfs.nxz')
+        with self.assertRaisesRegex(BuildError, 'another app'):
+            install.container_target('/sdcard/Android/data/other/files/x.nxz', FILES)
+
 
 if __name__ == '__main__':
     unittest.main()

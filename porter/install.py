@@ -56,14 +56,14 @@ def env_with_romfs(pack_env, folder):   # the pack's env.txt with the installer'
 CONTAINER_MARK = '# porter install --container-at'   # in the device's env.txt: the DM_ROMFS_CONTAINER row under it is the installer's, carried over by later installs
 
 
-def container_target(arg):
+def container_target(arg, files=None):
     """--container-at's file, checked before anything touches the device: an absolute path in shared storage"""
     if arg is None: return None
     if arg != arg.strip() or any(c in arg for c in '\r\n\0') or not arg.startswith('/'):
         raise BuildError(f'--container-at takes a file on the device as an absolute path (/sdcard/…, /storage/…): {arg!r}')
     d = posixpath.normpath(arg)
     if not d.startswith(('/sdcard/', '/storage/')): raise BuildError(f'--container-at {d}: the app can read only shared storage, /sdcard/… or /storage/… (an SD card: /storage/<its id>/…)')
-    if re.search(r'/Android/(data|obb)(/|$)', d, re.I):
+    if re.search(r'/Android/(data|obb)(/|$)', d, re.I) and not (files and (d + '/').startswith(files + '/')):
         raise BuildError(f'--container-at {d}: Android lets no app read a file under another app\'s Android/data or Android/obb, even with All files access: move it elsewhere (/sdcard/Games/…)')
     if len(d.encode()) > 512: raise BuildError(f'--container-at: a path of at most 512 bytes (the host\'s path buffers): {d}')
     return d
@@ -133,7 +133,8 @@ def install(apk, data, adb_exe, serial=None, replace_signer=False, romfs_at=None
     files = datapack.files_folder(man['package'])
     target = romfs_target(romfs_at, files)
     container = data / 'romfs.nxz'
-    container_path = container_target(container_at)
+    container_path = container_target(container_at, files)
+    if container_push and not container_at: raise BuildError('--container-push needs --container-at <a file on the device>')
     if container_path and not container.is_file():
         raise BuildError(f'{data} has no romfs.nxz: port the game with android.tsv romfs container, or install without --container-at')
     if container_path: target = None   # the RomFS is the container, not a folder
