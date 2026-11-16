@@ -156,6 +156,72 @@ static int dm_fs_test_fail(const char *pt) {
 }
 static int in_txn_dir(const char *hp) { for (int i = 0; i < g_nmnt; i++) { size_t n = strlen(g_mnt[i].dir); if (g_mnt[i].commit[0] && !strncmp(hp, g_mnt[i].dir, n) && (hp[n] == '/' || !hp[n])) return 1; } return 0; }
 static int rm_tree(const char *p);
+// A single-file RomFS container (porter/romfs_container.py, a profile's android.tsv romfs container): the whole RomFS in one file, so the installer pushes one
+// resumable file. The host extracts it once into DM_TEMP (internal storage, fast) and mounts that folder: the path resolution and directory listings stay the
+// folder reader's, and the extraction is one-time (a marker file beside it names the container's size and mtime).
+#if defined(__ANDROID__)
+typedef struct __attribute__((packed)) { char m[4]; uint32_t ver, n; uint64_t idx, data, z; } cfhdr_t;
+_Static_assert(sizeof(cfhdr_t) == 36, "container header");
+static int cf_is_container(const char *path) {
+    int fd = open(path, O_RDONLY); if (fd < 0) return 0;
+    char m[4]; int ok = pread(fd, m, 4, 0) == 4 && !memcmp(m, "NXZC", 4); close(fd); return ok;
+}
+static int cf_mkdirs(const char *path) {   // mkdir -p for the file's parent
+    char p[4096]; strlcpy(p, path, sizeof p); char *s = strrchr(p, '/'); if (!s) return 0; *s = 0;
+    for (char *q = p + 1; *q; q++) if (*q == '/') { *q = 0; mkdir(p, 0755); *q = '/'; }
+    return mkdir(p, 0755) && errno != EEXIST ? -1 : 0;
+}
+static int cf_extract(const char *container, const char *dst) {
+    int fd = open(container, O_RDONLY | O_CLOEXEC); if (fd < 0) return -1;
+    cfhdr_t h; if (pread(fd, &h, sizeof h, 0) != (ssize_t)sizeof h || memcmp(h.m, "NXZC", 4) || h.ver != 1) { close(fd); return -1; }
+    if (lseek(fd, (off_t)h.idx, SEEK_SET) < 0) { close(fd); return -1; }
+    for (uint32_t i = 0; i < h.n; i++) {
+        uint16_t L; char rel[4096]; uint64_t raw, table; uint32_t bs, nb;
+        if (read(fd, &L, 2) != 2 || L >= sizeof rel || read(fd, rel, L) != L) { close(fd); return -1; }
+        rel[L] = 0;
+        if (read(fd, &raw, 8) != 8 || read(fd, &bs, 4) != 4 || read(fd, &nb, 4) != 4 || read(fd, &table, 8) != 8) { close(fd); return -1; }
+        char out[4096]; snprintf(out, sizeof out, "%s/%s", dst, rel);
+        if (cf_mkdirs(out)) { close(fd); return -1; }
+        uint64_t *offs = malloc(8 * ((size_t)nb + 1));
+        if (!offs || pread(fd, offs, 8 * ((size_t)nb + 1), (off_t)table) != (ssize_t)(8 * ((size_t)nb + 1))) { free(offs); close(fd); return -1; }
+        int ofd = open(out, O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, 0644);
+        if (ofd < 0) { free(offs); close(fd); return -1; }
+        int bad = 0;
+        for (uint32_t b = 0; b < nb && !bad; b++) {
+            size_t len = (size_t)(offs[b + 1] - offs[b]), want = b + 1 < nb ? bs : (size_t)(raw - (uint64_t)b * bs);
+            uint8_t *buf = malloc(len ? len : 1);
+            if (!buf || pread(fd, buf, len, (off_t)offs[b]) != (ssize_t)len) { free(buf); bad = 1; break; }
+            if (len == want) { if (write(ofd, buf, want) != (ssize_t)want) bad = 1; }
+            else {
+                uint8_t *outb = malloc(want ? want : 1); size_t r = outb ? ZSTD_decompress(outb, want, buf, len) : 0;
+                if (!outb || ZSTD_isError(r) || r != want || write(ofd, outb, want) != (ssize_t)want) bad = 1;
+                free(outb);
+            }
+            free(buf);
+        }
+        close(ofd); free(offs);
+        if (bad) { close(fd); return -1; }
+    }
+    close(fd); return 0;
+}
+static int cf_extract_cached(const char *container, const char *dst) {   // 0: dst holds the container's files
+    struct stat st; if (stat(container, &st)) return -1;
+    char mark[4096]; snprintf(mark, sizeof mark, "%s/.nx2a-container", dst);
+    char want[128]; snprintf(want, sizeof want, "%lld %lld", (long long)st.st_size, (long long)st.st_mtime);
+    char have[128] = ""; FILE *f = fopen(mark, "r");
+    if (f) { if (fgets(have, sizeof have, f)) { char *e = have + strlen(have); while (e > have && (e[-1] == '\n' || e[-1] == '\r')) *--e = 0; } fclose(f); }
+    if (!strcmp(have, want)) return 0;
+    char tmp[4096]; snprintf(tmp, sizeof tmp, "%s.new", dst);
+    rm_tree(tmp); mkdir(tmp, 0755);
+    if (cf_extract(container, tmp)) { rm_tree(tmp); return -1; }
+    rm_tree(dst); if (rename(tmp, dst)) { rm_tree(tmp); return -1; }
+    f = fopen(mark, "w"); if (f) { fprintf(f, "%s\n", want); fclose(f); }
+    return 0;
+}
+#else
+static inline int cf_is_container(const char *path) { (void)path; return 0; }
+static inline int cf_extract_cached(const char *container, const char *dst) { (void)container; (void)dst; return -1; }
+#endif
 static Result mount_ex(const char *name, const char *dir, int ro, int txn) {
     PATH_LOCK(); pthread_mutex_lock(&g_lock);
     for (int i = 0; i < g_nmnt; i++)
@@ -410,7 +476,15 @@ static Result err_res(const char *op, const char *path) {
 HLE_FORCE("_ZN2nn2fs22QueryMountRomCacheSizeEPm", "fsp-srv; rom reads the host directory directly, the cache gets only the minimum size", Result, h_fs_QueryRomCache, size_t *out) { *out = 0x1000; return RES_OK; }
 HLE_FORCE("_ZN2nn2fs8MountRomEPKcPvm", "fsp-srv; rom → host RomFS directory", Result, h_fs_MountRom, const char *name, void *cache, size_t sz) {
     (void)cache; (void)sz; char b[1024];
-    Result r = mount(name, envdir("DM_ROMFS", "romfs", b, sizeof b), 1);
+    const char *dir = envdir("DM_ROMFS", "romfs", b, sizeof b);
+    char t[1024], tmp[1300];
+    if (cf_is_container(dir)) {   // a single-file RomFS container: extract it once into DM_TEMP, then mount that folder
+        snprintf(tmp, sizeof tmp, "%s/romfs", envdir("DM_TEMP", "run/platform/temp", t, sizeof t));
+        if (cf_extract_cached(dir, tmp)) { LOG("[RED] fs mount rom: the RomFS container %s could not be extracted", dir); return RES_FAIL; }
+        LOG("fs mount rom: container %s extracted to %s", dir, tmp);
+        dir = tmp;
+    }
+    Result r = mount(name, dir, 1);
     if (r == RES_OK && getenv("DM_ROMFS_OVERLAY")) {
         PATH_LOCK();
         for (int i = 0; i < g_nmnt; i++) if (!strcmp(g_mnt[i].name, name)) {
