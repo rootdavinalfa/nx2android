@@ -176,6 +176,7 @@ class DataPack(unittest.TestCase):
             man = datapack.build(t / 'out-data', profile=p, version='v196608', display='1.03', patched=t / 'patched', container=t / 'romfs.nxz', shaders=t / 'shaders.dmsv')
             o = t / 'out-data'
             self.assertTrue((o / 'romfs.nxz').is_file()); self.assertFalse((o / 'RomFS').exists())
+            self.assertEqual((o / 'romfs.nxz').stat().st_ino, (t / 'romfs.nxz').stat().st_ino)   # a hard link, not a 15 GB copy
             self.assertIn('DM_ROMFS_CONTAINER=/sdcard/Android/data/org.nx2a.neo/files/romfs.nxz', (o / 'env.txt').read_text())
             self.assertEqual(man['files'], 3)   # the module, the container, the shaders
         finally:
