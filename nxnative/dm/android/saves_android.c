@@ -54,7 +54,7 @@ static int copy_file(const char *src, const char *dst) {
     return r;
 }
 // src's tree into dst (made here: it must not exist); *files and *bytes add up what was copied; the first failure's -errno, its path in err
-static int copy_tree(const char *src, const char *dst, long *files, long long *bytes, char *err, int ecap) {
+int dm_copy_tree(const char *src, const char *dst, long *files, long long *bytes, char *err, int ecap) {
     if (mkdir(dst, 0770) && errno != EEXIST) { int e = errno; snprintf(err, (size_t)ecap, "%s", dst); return -e; }
     DIR *d = opendir(src); if (!d) { int e = errno; snprintf(err, (size_t)ecap, "%s", src); return -e; }
     struct dirent *e; int r = 0;
@@ -62,7 +62,7 @@ static int copy_tree(const char *src, const char *dst, long *files, long long *b
         if (!strcmp(e->d_name, ".") || !strcmp(e->d_name, "..")) continue;
         char a[1200], b[1200]; struct stat st; snprintf(a, sizeof a, "%s/%s", src, e->d_name); snprintf(b, sizeof b, "%s/%s", dst, e->d_name);
         if (lstat(a, &st)) { r = -errno; snprintf(err, (size_t)ecap, "%s", a); }
-        else if (S_ISDIR(st.st_mode)) r = copy_tree(a, b, files, bytes, err, ecap);
+        else if (S_ISDIR(st.st_mode)) r = dm_copy_tree(a, b, files, bytes, err, ecap);
         else if (S_ISREG(st.st_mode)) { if ((r = copy_file(a, b))) snprintf(err, (size_t)ecap, "%s", b); else { ++*files; *bytes += st.st_size; } }
     }
     closedir(d); return r;
@@ -98,22 +98,22 @@ void dm_saves_paths(const char *files_root) {
 }
 const char *dm_saves_dir(void) { return g_dir; }
 
-int dm_saves_export(const char *suffix, char *name, int cap, char *err, int ecap) {
+static int export_to(const char *base, const char *suffix, char *name, int cap, char *err, int ecap) {
     err[0] = 0;
     if (!g_save[0]) { snprintf(err, (size_t)ecap, "DM_SAVE is not set"); return -EINVAL; }
     int dev = is_dir(g_dev) && has_entries(g_dev);
     if (!has_entries(g_save) && !dev) { snprintf(err, (size_t)ecap, "the game has not saved yet"); return -ENOENT; }
-    mkdir(g_dir, 0770);
+    mkdir(base, 0770);
     char stamp[64], fin[700]; time_t t = time(NULL); struct tm tm; localtime_r(&t, &tm); strftime(stamp, sizeof stamp, "%Y%m%d-%H%M%S", &tm);
     snprintf(name, (size_t)cap, "%s%s", stamp, suffix);
-    for (int k = 2; snprintf(fin, sizeof fin, "%s/%s", g_dir, name), is_dir(fin) && k < 100; k++) snprintf(name, (size_t)cap, "%s%s-%d", stamp, suffix, k);
-    char part[700], partd[720], find[720]; snprintf(part, sizeof part, "%s/.%s.part", g_dir, name); snprintf(partd, sizeof partd, "%s.device", part); snprintf(find, sizeof find, "%s.device", fin);
+    for (int k = 2; snprintf(fin, sizeof fin, "%s/%s", base, name), is_dir(fin) && k < 100; k++) snprintf(name, (size_t)cap, "%s%s-%d", stamp, suffix, k);
+    char part[700], partd[720], find[720]; snprintf(part, sizeof part, "%s/.%s.part", base, name); snprintf(partd, sizeof partd, "%s.device", part); snprintf(find, sizeof find, "%s.device", fin);
     long files = 0; long long bytes = 0; int r = -EAGAIN;
     for (int attempt = 0; attempt < 3 && r == -EAGAIN; attempt++) {   // a commit swaps the tree being copied: copy it again
         uint64_t c0 = dm_fs_commit_count(); files = 0; bytes = 0; err[0] = 0;
         rm_tree(part); rm_tree(partd);
-        r = copy_tree(g_save, part, &files, &bytes, err, ecap);
-        if (!r && dev) r = copy_tree(g_dev, partd, &files, &bytes, err, ecap);
+        r = dm_copy_tree(g_save, part, &files, &bytes, err, ecap);
+        if (!r && dev) r = dm_copy_tree(g_dev, partd, &files, &bytes, err, ecap);
         if (dm_fs_commit_count() != c0) r = -EAGAIN;
     }
     if (!r && dev && rename(partd, find)) { r = -errno; snprintf(err, (size_t)ecap, "%s", find); }
@@ -124,6 +124,18 @@ int dm_saves_export(const char *suffix, char *name, int cap, char *err, int ecap
         LOG("[RED] [saves] export failed: %s", err); return r; }
     LOG("[saves] exported the save to %s: %ld files, %lld bytes%s", fin, files, bytes, dev ? " (with the device save)" : "");
     return 0;
+}
+int dm_saves_export(const char *suffix, char *name, int cap, char *err, int ecap) { return export_to(g_dir, suffix, name, cap, err, ecap); }
+int dm_saves_export_to(const char *dest, char *name, int cap, char *err, int ecap) { return export_to(dest, "", name, cap, err, ecap); }
+int dm_saves_import_from(const char *src, char *name, int cap, char *err, int ecap) {   // a folder the player picked: its files at the top, as a console's save tools copy them
+    const char *b = strrchr(src, '/'); b = b ? b + 1 : src;
+    snprintf(name, (size_t)cap, "%s", b);
+    char dst[700]; snprintf(dst, sizeof dst, "%s/%s", g_dir, name);
+    rm_tree(dst);
+    long files = 0; long long bytes = 0;
+    int r = dm_copy_tree(src, dst, &files, &bytes, err, ecap);
+    if (r) { rm_tree(dst); return r; }
+    return dm_saves_request_import(name);
 }
 
 static int by_newest(const void *a, const void *b) {
@@ -166,7 +178,7 @@ static void import_apply(const char *name, const char *req) {
     for (int k = 0; k < 2; k++) {   // both copies first, then both swaps
         snprintf(tmp[k], sizeof tmp[k], "%s.import", to[k]); rm_tree(tmp[k]);
         if (k == 1 && !is_dir(srcd)) continue;   // no device save in the folder: the game's own stays
-        if ((r = copy_tree(from[k], tmp[k], &files, &bytes, err, sizeof err))) { rm_tree(tmp[0]); rm_tree(tmp[1]);
+        if ((r = dm_copy_tree(from[k], tmp[k], &files, &bytes, err, sizeof err))) { rm_tree(tmp[0]); rm_tree(tmp[1]);
             result(req, "result=error\nerror=copying %s failed: %s (%s); the save is unchanged", name, err, strerror(-r)); return; }
     }
     for (int k = 0; k < 2; k++) if (is_dir(tmp[k]) && (r = swap_in(tmp[k], to[k]))) {

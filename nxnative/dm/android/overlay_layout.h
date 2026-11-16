@@ -204,8 +204,8 @@ static inline int ov_menu_track_value(float x, const float p[4], int row) {   //
 // ---- the start screen (front_android.c, before the host starts): the rows, the highlighted one, the missing-RomFS notice. It reuses the pause menu's panel
 // rectangle and row geometry; the rows are the game's start and the skip switch, and the notice when the RomFS is not there ----
 #define START_ST 0x80000
-enum { START_GAME, START_SKIP, START_RETRY, START_N };
-static const char *const START_LABELS[START_N] = {"Start game", "Don't show this screen again", "Retry (RomFS not found)"};
+enum { START_GAME, START_ROMFS, START_SAVE, START_EXPORT, START_IMPORT, START_SKIP, START_RETRY, START_N };
+static const char *const START_LABELS[START_N] = {"Start game", "ROM data location", "Save folder", "Export save to folder", "Import save from folder", "Don't show this screen again", "Retry (RomFS not found)"};
 #define START_ROWS (START_N + 1)   // the rows and the notice line
 
 // ---- the layout editor (front_android.c, from the menu's Edit layout): the game stays held; every control (the menu button too) can be dragged, and

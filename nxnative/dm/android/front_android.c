@@ -80,6 +80,7 @@ static _Atomic int g_set_opacity = 60;   // the gamepad's opacity, percent (OV_O
 static _Atomic int g_set_grid;   // the layout editor's Snap to grid
 static _Atomic int g_set_labels = -1;   // a controller's face buttons by their label (1) or their position (0); -1: as env.txt says (pad_labels)
 static _Atomic int g_start_screen = 1, g_start_hi, g_romfs_missing;   // the start screen (settings.txt start_screen=), its highlighted row, the missing-RomFS notice
+static char g_save_folder[600];   // settings.txt save_folder=: the game's save folder (a normal path), empty: the app's internal save
 // the player's own layout (overlay_layout.h dm_overlay_custom): [0] the saved one (settings.txt ui= rows), [1] the layout editor's while it is open; per layout
 // and control: x + 1, y + 1 in 1/10000 of the window's width and height (0 = the layout's place), the size factor in 1/1000 (0 = 1), 1 when hidden
 #define CUST_K 4
@@ -97,6 +98,7 @@ static void settings_load(void) {
         else if (sscanf(line, "grid=%d", &v) == 1) atomic_store(&g_set_grid, v != 0);
         else if (sscanf(line, "labels=%d", &v) == 1) atomic_store(&g_set_labels, v != 0);
         else if (sscanf(line, "start_screen=%d", &v) == 1) atomic_store(&g_start_screen, v != 0);
+        else if (!strncmp(line, "save_folder=", 12)) { char *e = line + 12; while (*e && *e != '\n' && *e != '\r') e++; *e = 0; snprintf(g_save_folder, sizeof g_save_folder, "%s", line + 12); }
         else if (!strncmp(line, "ui=", 3)) {   // ui=<layout>,<control>,<x>,<y>,<size>[,<hidden>]: x, y in 1/10000 of the window (-1 the layout's place), size in 1/1000
             char lay[16], name[32]; int x, y, z, hid = 0, l, i;
             if (sscanf(line + 3, "%15[^,],%31[^,],%d,%d,%d,%d", lay, name, &x, &y, &z, &hid) < 5 || (i = ctl_named(name)) < 0) continue;
@@ -116,6 +118,7 @@ static void settings_save(void) {
     fprintf(f, "overlay=%d\nrumble=%d\ndocked=%d\nfps=%d\nopacity=%d\ngrid=%d\nstart_screen=%d\n", atomic_load(&g_set_overlay), atomic_load(&g_set_rumble), dm_opmode() != 0, atomic_load(&g_set_fps),
             atomic_load(&g_set_opacity), atomic_load(&g_set_grid), atomic_load(&g_start_screen));
     if (atomic_load(&g_set_labels) >= 0) fprintf(f, "labels=%d\n", atomic_load(&g_set_labels));   // (only once the player chose: until then env.txt decides)
+    if (g_save_folder[0]) fprintf(f, "save_folder=%s\n", g_save_folder);
     for (int l = 0; l < 2; l++) for (int i = 0; i < OV_N; i++) {
         _Atomic int *c = g_cust[0][l][i]; int x = atomic_load(&c[0]), y = atomic_load(&c[1]), z = atomic_load(&c[2]), hid = atomic_load(&c[3]);
         if ((x && y) || z || hid) fprintf(f, "ui=%s,%s,%d,%d,%d,%d\n", LAYOUT_NAMES[l], OV_LAYOUTS[0][i].name, x && y ? x - 1 : -1, x && y ? y - 1 : -1, z ? z : 1000, hid);
@@ -540,6 +543,47 @@ static void menu_audio(void) {
     if ((*e)->ExceptionCheck(e)) { (*e)->ExceptionClear(e); LOG("[menu] audio selection is unavailable"); }
     if (attached) (*g_act->vm)->DetachCurrentThread(g_act->vm);
 }
+// The start screen's path rows: the app's own on-screen keyboard (front_text_input), so they work in the default APK with no Java.
+static int ask_path(const char *title, const char *initial, char *out, int cap) {
+    return front_text_input(title, "A folder on the device", "e.g. /sdcard/Games/fe", initial ? initial : "", cap - 1, out, cap);
+}
+static void romfs_location_change(void) {   // the start screen's ROM data location: copy the RomFS to the typed folder, then point env.txt at it
+    char path[512] = ""; const char *old = getenv("DM_ROMFS");
+    if (!ask_path("ROM data location", old, path, sizeof path)) return;
+    if (!path[0] || path[0] != '/') { LOG("[RED] RomFS location: %s is not an absolute path", path); return; }
+    char dst[1024]; snprintf(dst, sizeof dst, "%s/RomFS", path);
+    long files = 0; long long bytes = 0; char err[400] = "";
+    int r = dm_copy_tree(old, dst, &files, &bytes, err, sizeof err);
+    if (r) { LOG("[RED] RomFS location: copying %s to %s failed: %s", old, dst, err); return; }
+    char env[600]; snprintf(env, sizeof env, "%s/env.txt", g_root);
+    FILE *f = fopen(env, "a"); if (f) { fprintf(f, "\n# the start screen's ROM data location\nDM_ROMFS=%s\n", dst); fclose(f); }
+    setenv("DM_ROMFS", dst, 1);
+    LOG("RomFS location: %s → %s (%ld files, %lld bytes)", old, dst, files, bytes);
+}
+static void save_folder_change(void) {   // the start screen's save folder: the game's save moves there at the next start
+    char path[512] = "";
+    if (!ask_path("Save folder", g_save_folder, path, sizeof path)) return;
+    if (!path[0] || path[0] != '/') { LOG("[RED] save folder: %s is not an absolute path", path); return; }
+    snprintf(g_save_folder, sizeof g_save_folder, "%s", path);
+    settings_save();
+    LOG("save folder: %s (the game's save moves there at the next start)", path);
+}
+static void save_export_to(void) {   // the start screen's Export save to folder: a timestamped subfolder of the typed folder
+    char path[512] = "";
+    if (!ask_path("Export save to folder", "", path, sizeof path)) return;
+    char name[96], err[400];
+    int r = dm_saves_export_to(path, name, sizeof name, err, sizeof err);
+    if (r) LOG("[RED] [saves] export to %s failed: %s", path, err);
+    else LOG("[saves] exported the save to %s/%s", path, name);
+}
+static void save_import_from(void) {   // the start screen's Import save from folder: the folder's files at the top, imported at the next start
+    char path[512] = "";
+    if (!ask_path("Import save from folder", "", path, sizeof path)) return;
+    char name[96], err[400];
+    int r = dm_saves_import_from(path, name, sizeof name, err, sizeof err);
+    if (r) LOG("[RED] [saves] import from %s failed: %s", path, err);
+    else LOG("[saves] %s will be imported at the next start", name);
+}
 static void menu_do(int item) {
     if (item == OVM_OVERLAY) { atomic_store(&g_set_overlay, !atomic_load(&g_set_overlay)); atomic_store(&g_overlay, 1); settings_save(); }
     else if (item == OVM_RUMBLE) { int on = !atomic_load(&g_set_rumble); atomic_store(&g_set_rumble, on); dm_haptics_android_set(on); settings_save(); }
@@ -560,6 +604,10 @@ static void menu_do(int item) {
 static void start_host(void);
 static int romfs_readable(ANativeActivity *act, int sdk);
 static void start_screen_do(int item) {
+    if (item == START_ROMFS) { romfs_location_change(); dm_overlay_redraw(); return; }
+    if (item == START_SAVE) { save_folder_change(); dm_overlay_redraw(); return; }
+    if (item == START_EXPORT) { save_export_to(); dm_overlay_redraw(); return; }
+    if (item == START_IMPORT) { save_import_from(); dm_overlay_redraw(); return; }
     if (item == START_RETRY) {   // the RomFS was missing: check it again before starting
         if (!romfs_readable(g_act, g_sdk)) { dm_overlay_redraw(); return; }
         atomic_store(&g_romfs_missing, 0);
@@ -1320,10 +1368,12 @@ __attribute__((visibility("default"))) void ANativeActivity_onCreate(ANativeActi
     unsetenv("DM_CTL");   // a release build takes no remote key presses (the control file is a development tool)
 #endif
     // the save manager's requests (saves_android.c), before the host mounts the save: an import chosen in the menu or pushed by porter, an export porter asks for
+    settings_load();
+    if (g_save_folder[0]) setenv("DM_SAVE", g_save_folder, 1);   // the start screen's save folder
     if (dm_saves_start(g_root)) { LOG("[saves] the request asked the app to end: the game is not started"); g_quit = 1; return; }
     g_sdk = sdk;
     if (!romfs_readable(act, sdk)) atomic_store(&g_romfs_missing, 1);   // the start screen says the RomFS is missing and offers Retry
-    settings_load(); dm_haptics_android_start(act, atomic_load(&g_set_rumble)); dm_lan_android_start(act);
+    dm_haptics_android_start(act, atomic_load(&g_set_rumble)); dm_lan_android_start(act);
     { pthread_t w; if (!pthread_create(&w, NULL, pad_watch, act->vm)) pthread_detach(w); }
     { pthread_t w; if (!pthread_create(&w, NULL, temp_watch, act->vm)) pthread_detach(w); }
     LOG("NX2A host on Android: files %s, RomFS %s, saves %s", g_root, getenv("DM_ROMFS"), act->internalDataPath);
