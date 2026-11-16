@@ -30,6 +30,26 @@ class ContainerTest(unittest.TestCase):
             self.assertEqual(rc.unpack(dst, out), 1)
             self.assertEqual((out / 'empty.bin').read_bytes(), b'')
 
+    def test_rebuild_reuses_unchanged_blocks(self):
+        with tempfile.TemporaryDirectory() as t:
+            src, dst = Path(t) / 'src', Path(t) / 'romfs.nxz'
+            src.mkdir(); (src / 'a.bin').write_bytes(b'x' * 300_000)
+            rc.pack(src, dst); first = dst.read_bytes()
+            rc.pack(src, dst); second = dst.read_bytes()
+            self.assertEqual(first, second)   # the cache copied the blocks, the container is the same
+            self.assertTrue((dst.parent / (dst.name + '.json')).is_file())
+
+    def test_changed_file_is_repacked(self):
+        with tempfile.TemporaryDirectory() as t:
+            src, dst, out = Path(t) / 'src', Path(t) / 'romfs.nxz', Path(t) / 'out'
+            src.mkdir(); p = src / 'a.bin'; p.write_bytes(b'x' * 300_000)
+            rc.pack(src, dst); first = dst.read_bytes()
+            p.write_bytes(b'y' * 300_000)   # same size, new content and mtime
+            rc.pack(src, dst); second = dst.read_bytes()
+            self.assertNotEqual(first, second)
+            rc.unpack(dst, out)
+            self.assertEqual((out / 'a.bin').read_bytes(), b'y' * 300_000)
+
 
 if __name__ == '__main__':
     unittest.main()

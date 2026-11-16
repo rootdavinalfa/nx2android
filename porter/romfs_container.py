@@ -4,7 +4,7 @@
 #   data: per file, its block table (u64 offsets[n + 1]) and its blocks, as porter/romfs_pack.py stores them (a block as long as its raw bytes is stored, else one zstd frame)
 #   index: per file, u16 path length, the path, u64 raw size, u32 block size, u32 block count, u64 block table offset
 # The index is last so the data can be written in one pass; the header is rewritten at the end with the index offset.
-import concurrent.futures as cf, struct
+import concurrent.futures as cf, json, os, struct
 from pathlib import Path
 
 from porter import romfs_pack
@@ -42,25 +42,50 @@ def _pack_one(src, out, zstd):
 
 
 def pack(src, dst, jobs=8, progress=None):
-    """src: an extracted RomFS; dst: the container (replaced). progress(done bytes, total bytes). Returns (files, container bytes)"""
+    """src: an extracted RomFS; dst: the container (replaced). progress(done bytes, total bytes). Returns (files, container bytes).
+    A state file beside dst (dst.json) lets a rebuild copy the blocks of unchanged files from the previous container instead of compressing them again."""
     zstd = romfs_pack.zstd_mod()
     if not zstd: raise RuntimeError(f'Python {__import__("sys").version_info[0]}.{__import__("sys").version_info[1]} has no compression.zstd (3.14+): pip install backports.zstd')
     src, dst = Path(src), Path(dst)
+    sf = dst.with_name(dst.name + '.json')
+    try: state = json.loads(sf.read_text(encoding='utf-8'))
+    except (OSError, ValueError): state = {}
+    old = None
+    if state and dst.is_file():
+        try: old = open(dst, 'rb')
+        except OSError: old = None
     files = sorted(p for p in src.rglob('*') if p.is_file())
     total = sum(p.stat().st_size for p in files); done = 0; entries = []
     tmp = dst.with_name(dst.name + '.partial')   # a failed pack leaves no half container at dst
     with open(tmp, 'wb') as out:
         out.write(b'\0' * HDR.size); data = HDR.size
         for p in files:
-            rel = p.relative_to(src).as_posix()
-            raw, bs, n, table = _pack_one(p, out, zstd)
-            entries.append((rel, raw, bs, n, table)); done += raw
+            rel = p.relative_to(src).as_posix(); st = p.stat(); key = [st.st_size, st.st_mtime_ns]
+            o = state.get(rel)
+            if old and o and o.get('src') == key and o.get('n') is not None:   # unchanged: copy the blocks from the previous container
+                n = o['n']; raw = o['raw']; bs = o['bs']; table = out.tell()
+                old.seek(o['table']); old_off = struct.unpack(f'<{n + 1}Q', old.read(8 * (n + 1)))
+                out.write(b'\0' * (8 * (n + 1))); new_data = table + 8 * (n + 1)
+                old.seek(o['data']); left = o['len']
+                while left:
+                    chunk = old.read(min(left, 1 << 20))
+                    if not chunk: raise OSError(f'{dst}: the previous container is shorter than its state')
+                    out.write(chunk); left -= len(chunk)
+                end = out.tell(); out.seek(table); out.write(struct.pack(f'<{n + 1}Q', *(new_data + (x - o['data']) for x in old_off))); out.seek(end)
+                length = o['len']
+            else:
+                raw, bs, n, table = _pack_one(p, out, zstd)
+                length = out.tell() - (table + 8 * (n + 1))
+            entries.append((rel, raw, bs, n, table, length, key)); done += raw
             if progress: progress(done, total)
         index = out.tell()
-        for rel, raw, bs, n, table in entries:
+        for rel, raw, bs, n, table, length, key in entries:
             b = rel.encode('utf-8'); out.write(ENT.pack(len(b))); out.write(b); out.write(struct.pack('<QIIQ', raw, bs, n, table))
         out.seek(0); out.write(HDR.pack(MAGIC, VERSION, len(entries), index, data, 0))
+    if old: old.close()
     tmp.replace(dst)
+    sf.write_text(json.dumps({rel: {'src': key, 'raw': raw, 'bs': bs, 'n': n, 'table': table, 'data': table + 8 * (n + 1), 'len': length}
+                              for rel, raw, bs, n, table, length, key in entries}), encoding='utf-8')
     return len(entries), dst.stat().st_size
 
 
