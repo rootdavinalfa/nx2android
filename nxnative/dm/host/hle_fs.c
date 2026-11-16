@@ -35,7 +35,8 @@ _Static_assert(sizeof(DirectoryEntry) == 0x310, "DirectoryEntry layout");
 // Host: at mount, the committed directory commit (= $DM_SAVE) is clonefile'd as a whole tree into the working directory <commit>.work (APFS copy-on-write, nearly zero cost), and the mount points at the working directory,
 // all game reads and writes happen in the working directory; Commit = clonefile(work → <commit>.new), then renamex_np(RENAME_SWAP) swaps it atomically with commit, then the swapped-out old version is deleted.
 // Killed at any moment, commit is either the old version or the new version, never half-written / a mix of old and new; the next mount discards leftover .work / .new.
-typedef struct { char name[32]; char dir[1024]; char overlay[4096]; char commit[1024]; int ro; } mount_t;
+typedef struct cf_s cf_t;
+typedef struct { char name[32]; char dir[1024]; char overlay[4096]; char commit[1024]; int ro; cf_t *cf; } mount_t;
 static mount_t g_mnt[MAX_MOUNT];   // commit non-empty = transactional save mount
 static int g_nmnt;
 static pthread_mutex_t g_lock = PTHREAD_MUTEX_INITIALIZER;
@@ -157,70 +158,82 @@ static int dm_fs_test_fail(const char *pt) {
 static int in_txn_dir(const char *hp) { for (int i = 0; i < g_nmnt; i++) { size_t n = strlen(g_mnt[i].dir); if (g_mnt[i].commit[0] && !strncmp(hp, g_mnt[i].dir, n) && (hp[n] == '/' || !hp[n])) return 1; } return 0; }
 static int rm_tree(const char *p);
 // A single-file RomFS container (porter/romfs_container.py, a profile's android.tsv romfs container): the whole RomFS in one file, so the installer pushes one
-// resumable file. The host extracts it once into DM_TEMP (internal storage, fast) and mounts that folder: the path resolution and directory listings stay the
-// folder reader's, and the extraction is one-time (a marker file beside it names the container's size and mtime).
+// resumable file. The host reads it in place: the index is loaded at mount, OpenFile/ReadFile/GetFileSize/ReadDirectory serve the entries, and the blocks are
+// decompressed on demand by the same zf_* reader the packed files use. The legacy folder RomFS is unchanged.
 #if defined(__ANDROID__)
 typedef struct __attribute__((packed)) { char m[4]; uint32_t ver, n; uint64_t idx, data, z; } cfhdr_t;
 _Static_assert(sizeof(cfhdr_t) == 36, "container header");
+typedef struct { char *path; uint64_t raw; uint32_t bs, n; uint64_t table; } cf_entry_t;
+struct cf_s { int fd; cf_entry_t *e; size_t n; };
 static int cf_is_container(const char *path) {
     int fd = open(path, O_RDONLY); if (fd < 0) return 0;
     char m[4]; int ok = pread(fd, m, 4, 0) == 4 && !memcmp(m, "NXZC", 4); close(fd); return ok;
 }
-static int cf_mkdirs(const char *path) {   // mkdir -p for the file's parent
-    char p[4096]; strlcpy(p, path, sizeof p); char *s = strrchr(p, '/'); if (!s) return 0; *s = 0;
-    for (char *q = p + 1; *q; q++) if (*q == '/') { *q = 0; mkdir(p, 0755); *q = '/'; }
-    return mkdir(p, 0755) && errno != EEXIST ? -1 : 0;
-}
-static int cf_extract(const char *container, const char *dst) {
-    int fd = open(container, O_RDONLY | O_CLOEXEC); if (fd < 0) return -1;
-    cfhdr_t h; if (pread(fd, &h, sizeof h, 0) != (ssize_t)sizeof h || memcmp(h.m, "NXZC", 4) || h.ver != 1) { close(fd); return -1; }
-    if (lseek(fd, (off_t)h.idx, SEEK_SET) < 0) { close(fd); return -1; }
+static void cf_close(cf_t *c);
+static int cf_cmp(const void *a, const void *b) { return strcmp(((const cf_entry_t *)a)->path, ((const cf_entry_t *)b)->path); }
+static cf_t *cf_open(const char *path) {
+    int fd = open(path, O_RDONLY | O_CLOEXEC); if (fd < 0) return NULL;
+    cfhdr_t h; if (pread(fd, &h, sizeof h, 0) != (ssize_t)sizeof h || memcmp(h.m, "NXZC", 4) || h.ver != 1) { close(fd); return NULL; }
+    cf_t *c = calloc(1, sizeof *c); if (!c) { close(fd); return NULL; }
+    c->fd = fd; c->n = h.n; c->e = calloc(h.n ? h.n : 1, sizeof *c->e);
+    if (!c->e || lseek(fd, (off_t)h.idx, SEEK_SET) < 0) { cf_close(c); return NULL; }
     for (uint32_t i = 0; i < h.n; i++) {
-        uint16_t L; char rel[4096]; uint64_t raw, table; uint32_t bs, nb;
-        if (read(fd, &L, 2) != 2 || L >= sizeof rel || read(fd, rel, L) != L) { close(fd); return -1; }
-        rel[L] = 0;
-        if (read(fd, &raw, 8) != 8 || read(fd, &bs, 4) != 4 || read(fd, &nb, 4) != 4 || read(fd, &table, 8) != 8) { close(fd); return -1; }
-        char out[4096]; snprintf(out, sizeof out, "%s/%s", dst, rel);
-        if (cf_mkdirs(out)) { close(fd); return -1; }
-        uint64_t *offs = malloc(8 * ((size_t)nb + 1));
-        if (!offs || pread(fd, offs, 8 * ((size_t)nb + 1), (off_t)table) != (ssize_t)(8 * ((size_t)nb + 1))) { free(offs); close(fd); return -1; }
-        int ofd = open(out, O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, 0644);
-        if (ofd < 0) { free(offs); close(fd); return -1; }
-        int bad = 0;
-        for (uint32_t b = 0; b < nb && !bad; b++) {
-            size_t len = (size_t)(offs[b + 1] - offs[b]), want = b + 1 < nb ? bs : (size_t)(raw - (uint64_t)b * bs);
-            uint8_t *buf = malloc(len ? len : 1);
-            if (!buf || pread(fd, buf, len, (off_t)offs[b]) != (ssize_t)len) { free(buf); bad = 1; break; }
-            if (len == want) { if (write(ofd, buf, want) != (ssize_t)want) bad = 1; }
-            else {
-                uint8_t *outb = malloc(want ? want : 1); size_t r = outb ? ZSTD_decompress(outb, want, buf, len) : 0;
-                if (!outb || ZSTD_isError(r) || r != want || write(ofd, outb, want) != (ssize_t)want) bad = 1;
-                free(outb);
-            }
-            free(buf);
-        }
-        close(ofd); free(offs);
-        if (bad) { close(fd); return -1; }
+        uint16_t L; uint64_t raw, table; uint32_t bs, nb;
+        if (read(fd, &L, 2) != 2 || read(fd, &raw, 8) != 8 || read(fd, &bs, 4) != 4 || read(fd, &nb, 4) != 4 || read(fd, &table, 8) != 8) { cf_close(c); return NULL; }
+        c->e[i].path = malloc((size_t)L + 1);
+        if (!c->e[i].path || read(fd, c->e[i].path, L) != L) { cf_close(c); return NULL; }
+        c->e[i].path[L] = 0; c->e[i].raw = raw; c->e[i].bs = bs; c->e[i].n = nb; c->e[i].table = table;
     }
-    close(fd); return 0;
+    qsort(c->e, c->n, sizeof *c->e, cf_cmp);
+    return c;
 }
-static int cf_extract_cached(const char *container, const char *dst) {   // 0: dst holds the container's files
-    struct stat st; if (stat(container, &st)) return -1;
-    char mark[4096]; snprintf(mark, sizeof mark, "%s/.nx2a-container", dst);
-    char want[128]; snprintf(want, sizeof want, "%lld %lld", (long long)st.st_size, (long long)st.st_mtime);
-    char have[128] = ""; FILE *f = fopen(mark, "r");
-    if (f) { if (fgets(have, sizeof have, f)) { char *e = have + strlen(have); while (e > have && (e[-1] == '\n' || e[-1] == '\r')) *--e = 0; } fclose(f); }
-    if (!strcmp(have, want)) return 0;
-    char tmp[4096]; snprintf(tmp, sizeof tmp, "%s.new", dst);
-    rm_tree(tmp); mkdir(tmp, 0755);
-    if (cf_extract(container, tmp)) { rm_tree(tmp); return -1; }
-    rm_tree(dst); if (rename(tmp, dst)) { rm_tree(tmp); return -1; }
-    f = fopen(mark, "w"); if (f) { fprintf(f, "%s\n", want); fclose(f); }
+static void cf_close(cf_t *c) { if (!c) return; for (size_t i = 0; i < c->n; i++) free(c->e[i].path); free(c->e); close(c->fd); free(c); }
+static cf_entry_t *cf_find(cf_t *c, const char *rel) {
+    cf_entry_t key = { .path = (char *)rel };
+    return bsearch(&key, c->e, c->n, sizeof *c->e, cf_cmp);
+}
+static int cf_is_dir(cf_t *c, const char *rel) {   // a directory is a prefix of some entry's path
+    size_t L = strlen(rel);
+    for (size_t i = 0; i < c->n; i++) if (!strncmp(c->e[i].path, rel, L) && c->e[i].path[L] == '/') return 1;
     return 0;
+}
+static void cf_dir_entries(cf_t *c, const char *rel, DirectoryEntry **out, int64_t *n) {   // the entries directly under rel, as ReadDirectory lists them
+    size_t L = strlen(rel); int64_t k = 0, cap = 0; DirectoryEntry *v = NULL;
+    for (size_t i = 0; i < c->n; i++) {
+        const char *p = c->e[i].path;
+        if (L && (strncmp(p, rel, L) || p[L] != '/')) continue;
+        const char *name = p + (L ? L + 1 : 0);
+        if (!*name) continue;
+        const char *slash = strchr(name, '/');
+        char d[0x301]; const char *add; int type; uint64_t size;
+        if (!slash) { add = name; type = ENT_FILE; size = c->e[i].raw; }   // a file: unique by path
+        else {   // a subdirectory: the same name repeats for each file under it
+            size_t dl = (size_t)(slash - name); if (dl >= sizeof d) continue;
+            memcpy(d, name, dl); d[dl] = 0; add = d; type = ENT_DIR; size = 0;
+            int dup = 0; for (int64_t j = 0; j < k; j++) if (!strcmp(v[j].name, add)) { dup = 1; break; }
+            if (dup) continue;
+        }
+        if (k == cap) { cap = cap ? cap * 2 : 16; DirectoryEntry *nv = realloc(v, (size_t)cap * sizeof *v); if (!nv) { free(v); *out = NULL; *n = 0; return; } v = nv; }
+        memset(&v[k], 0, sizeof v[k]); strlcpy(v[k].name, add, sizeof v[k].name); v[k].type = type; v[k].size = size; k++;
+    }
+    *out = v; *n = k;
+}
+static zfile_t *zf_open_entry(int fd, uint64_t raw, uint32_t bs, uint32_t n, uint64_t table) {
+    zfile_t *z = calloc(1, sizeof *z); uint64_t *off = malloc(8 * ((size_t)n + 1));
+    if (!z || !off || pread(fd, off, 8 * ((size_t)n + 1), (off_t)table) != (ssize_t)(8 * ((size_t)n + 1))) { free(z); free(off); return NULL; }
+    z->raw = raw; z->bs = bs; z->n = n; z->off = off; z->cbuf = NULL; z->cblk = -1; pthread_mutex_init(&z->mu, NULL);
+    return z;
+}
+static cf_t *cf_mount(const char *path, const char **rel) {   // the container mount a guest path names, and its path inside the container
+    const char *c = strchr(path, ':'); if (!c) return NULL;
+    size_t ln = (size_t)(c - path);
+    for (int i = 0; i < g_nmnt; i++) if (g_mnt[i].cf && strlen(g_mnt[i].name) == ln && !strncmp(g_mnt[i].name, path, ln)) {
+        const char *r = c + 1; while (*r == '/') r++; *rel = r; return g_mnt[i].cf;
+    }
+    return NULL;
 }
 #else
 static inline int cf_is_container(const char *path) { (void)path; return 0; }
-static inline int cf_extract_cached(const char *container, const char *dst) { (void)container; (void)dst; return -1; }
 #endif
 static Result mount_ex(const char *name, const char *dir, int ro, int txn) {
     PATH_LOCK(); pthread_mutex_lock(&g_lock);
@@ -228,7 +241,7 @@ static Result mount_ex(const char *name, const char *dir, int ro, int txn) {
         if (!strcmp(g_mnt[i].name, name)) { pthread_mutex_unlock(&g_lock); return RES_OK; }
     if (g_nmnt >= MAX_MOUNT) die("mount table full");
     strlcpy(g_mnt[g_nmnt].name, name, sizeof g_mnt[0].name);
-    g_mnt[g_nmnt].ro = ro; g_mnt[g_nmnt].overlay[0] = 0; g_mnt[g_nmnt].commit[0] = 0;
+    g_mnt[g_nmnt].ro = ro; g_mnt[g_nmnt].overlay[0] = 0; g_mnt[g_nmnt].commit[0] = 0; g_mnt[g_nmnt].cf = NULL;
     if (!strcmp(name, "rom") && getenv("DM_ROMFS_OVERLAY"))
         strlcpy(g_mnt[g_nmnt].overlay, getenv("DM_ROMFS_OVERLAY"), sizeof g_mnt[0].overlay);
     // The transaction directory cannot be set up (leftovers cannot be cleared / clone failed, which really happens on a full disk): do not exit; mount the committed directory read-only -- saves still read, every write fails, commits are no-ops, the committed version is untouched, and the front end is told
@@ -257,7 +270,7 @@ static Result mount_ex(const char *name, const char *dir, int ro, int txn) {
     if (!ro && !txn) mkdir(dir, 0755);
     LOG("fs mount %s: → %s%s%s", name, txn ? g_mnt[g_nmnt - 1].dir : dir, ro || txn_err ? " (read-only)" : txn ? " (transactional save: work directory, swapped in atomically on Commit)" : "", g_mnt[g_nmnt - 1].overlay[0] ? " (overlay first)" : "");
     // A read-only mount the host may not list: every lookup in it fails with EACCES and the game sees no files at all (issue #9: Mario vs. Donkey Kong then dereferenced a null at its first heap setup, which read as a crash of its own)
-    if (ro && !txn) { DIR *d = opendir(dir); int e = errno; struct stat st;
+    if (ro && !txn && !cf_is_container(dir)) { DIR *d = opendir(dir); int e = errno; struct stat st;
         if (d) closedir(d);
         else if (e == ENOENT) ;   // a game with no RomFS of its own, or a stand-in that is not there: lookups answer "not found" as they should
         else if (!stat(dir, &st))
@@ -477,14 +490,16 @@ HLE_FORCE("_ZN2nn2fs22QueryMountRomCacheSizeEPm", "fsp-srv; rom reads the host d
 HLE_FORCE("_ZN2nn2fs8MountRomEPKcPvm", "fsp-srv; rom → host RomFS directory", Result, h_fs_MountRom, const char *name, void *cache, size_t sz) {
     (void)cache; (void)sz; char b[1024];
     const char *dir = envdir("DM_ROMFS", "romfs", b, sizeof b);
-    char t[1024], tmp[1300];
-    if (cf_is_container(dir)) {   // a single-file RomFS container: extract it once into DM_TEMP, then mount that folder
-        snprintf(tmp, sizeof tmp, "%s/romfs", envdir("DM_TEMP", "run/platform/temp", t, sizeof t));
-        if (cf_extract_cached(dir, tmp)) { LOG("[RED] fs mount rom: the RomFS container %s could not be extracted", dir); return RES_FAIL; }
-        LOG("fs mount rom: container %s extracted to %s", dir, tmp);
-        dir = tmp;
-    }
     Result r = mount(name, dir, 1);
+#if defined(__ANDROID__)
+    if (r == RES_OK && cf_is_container(dir)) {   // a single-file RomFS container: read it in place
+        cf_t *cf = cf_open(dir);
+        if (!cf) { LOG("[RED] fs mount rom: the RomFS container %s could not be read", dir); return RES_FAIL; }
+        PATH_LOCK();
+        for (int i = 0; i < g_nmnt; i++) if (!strcmp(g_mnt[i].name, name)) { g_mnt[i].cf = cf; break; }
+        LOG("fs mount rom: container %s (%zu files)", dir, cf->n);
+    }
+#endif
     if (r == RES_OK && getenv("DM_ROMFS_OVERLAY")) {
         PATH_LOCK();
         for (int i = 0; i < g_nmnt; i++) if (!strcmp(g_mnt[i].name, name)) {
@@ -760,6 +775,20 @@ HLE_FORCE("_ZN2nn2fs7UnmountEPKc", "fsp-srv; the mount table is permanent, unmou
 
 // ---------- Files ----------
 HLE_FORCE("_ZN2nn2fs8OpenFileEPNS0_10FileHandleEPKci", "fsp-srv → open(2)", Result, h_fs_OpenFile, uint64_t *out, const char *path, int mode) {
+#if defined(__ANDROID__)
+    const char *rel; cf_t *cf = cf_mount(path, &rel);
+    if (cf) {   // a single-file RomFS container: the entry's blocks are read on demand
+        if (mode & (MODE_WRITE | MODE_APPEND)) return RES_FAIL;
+        cf_entry_t *e = cf_find(cf, rel);
+        if (!e) return RES_PATH_NOT_FOUND;
+        int fd = dup(cf->fd); if (fd < 0) return RES_FAIL;
+        if (fd >= (int)sizeof g_fmode) { close(fd); die("fd beyond the table"); }
+        g_fmode[fd] = (uint8_t)mode; *out = (uint64_t)fd; g_fsave[fd] = 0;
+        ZF(fd) = zf_open_entry(fd, e->raw, e->bs, e->n, e->table);
+        if (!ZF(fd)) { close(fd); return RES_FAIL; }
+        return RES_OK;
+    }
+#endif
     HP(path);
     if (mode & (MODE_WRITE | MODE_APPEND)) RW();
     int fd = open(hp, (mode & (MODE_WRITE | MODE_APPEND)) ? ((mode & MODE_READ) ? O_RDWR : O_WRONLY) : O_RDONLY);
@@ -786,7 +815,7 @@ HLE_FORCE("_ZN2nn2fs8ReadFileEPmNS0_10FileHandleElPvm", "fsp-srv → pread(2)", 
     size_t got = 0; int reprep = 0;
     dm_guest_write_prepare(buf, sz);   // The destination may be a texture pool page write-protected by the graphics layer: a kernel write to a read-only page returns EFAULT instead of page-faulting, so unprotect and mark dirty first
 #if defined(__ANDROID__)
-    if (zon() && ZF(h)) {   // a packed RomFS file: decompressed in user space, so a page protected again meanwhile faults into the tracker's handler as any guest write does
+    if (ZF(h)) {   // a packed RomFS file or a container entry: decompressed in user space, so a page protected again meanwhile faults into the tracker's handler as any guest write does
         if (zf_read(ZF(h), (int)h, (uint64_t)off, buf, sz, &got)) { LOG("[RED] fs ReadFile: packed RomFS file fd %d at %#llx+%#zx could not be read or decompressed", (int)h, (long long)off, sz); errno = EIO; return err_res("packed read", "fd"); }
         sz = got;   // the loop below does nothing more
     }
@@ -849,7 +878,7 @@ HLE_FORCE("_ZN2nn2fs9WriteFileENS0_10FileHandleElPKvmRKNS0_11WriteOptionE", "fsp
 HLE_FORCE("_ZN2nn2fs11GetFileSizeEPlNS0_10FileHandleE", "fsp-srv → fstat(2)", Result, h_fs_GetFileSize, int64_t *out, uint64_t h) {
     if (!h) return RES_FAIL;
 #if defined(__ANDROID__)
-    if (zon() && ZF(h)) { *out = (int64_t)ZF(h)->raw; return RES_OK; }   // a packed RomFS file: the original's size
+    if (ZF(h)) { *out = (int64_t)ZF(h)->raw; return RES_OK; }   // a packed RomFS file or a container entry: the original's size
 #endif
     struct stat st; if (fstat((int)h, &st)) return err_res("fstat", "fd");
     *out = st.st_size; return RES_OK;
@@ -863,7 +892,7 @@ HLE_FORCE("_ZN2nn2fs11SetFileSizeENS0_10FileHandleEl", "fsp-srv → ftruncate(2)
 HLE_FORCE("_ZN2nn2fs9FlushFileENS0_10FileHandleE", "fsp-srv; host writes are already in the page cache, flushing is a no-op", Result, h_fs_FlushFile, uint64_t h) { (void)h; return RES_OK; }
 HLE_FORCE("_ZN2nn2fs9CloseFileENS0_10FileHandleE", "fsp-srv → close(2)", void, h_fs_CloseFile, uint64_t h) {
     if (!h) return;   // the null handle after a failed open (see ReadFile): do not touch fd 0
-    g_fmode[(int)h & 0xffff] = 0; g_fsave[(int)h & 0xffff] = 0; if (zon()) zf_close((int)h);
+    g_fmode[(int)h & 0xffff] = 0; g_fsave[(int)h & 0xffff] = 0; zf_close((int)h);
     close((int)h); }
 HLE_FORCE("_ZN2nn2fs15GetFileOpenModeENS0_10FileHandleE", "fsp-srv; the open mode is recorded by the host", int, h_fs_GetFileOpenMode, uint64_t h) { return g_fmode[(int)h & 0xffff]; }
 
@@ -936,6 +965,14 @@ HLE_FORCE("_ZN2nn2fs10RenameFileEPKcS2_", "fsp-srv → rename(2)", Result, h_fs_
 // The Great Ace Attorney Chronicles (SDK 10) imports it; a directory carries its guest name the same way as a file
 HLE_FORCE("_ZN2nn2fs15RenameDirectoryEPKcS2_", "fsp-srv → rename(2) of a directory", Result, h_fs_RenameDir, const char *from, const char *to) { return rename_entry(from, to); }
 HLE_FORCE("_ZN2nn2fs12GetEntryTypeEPNS0_18DirectoryEntryTypeEPKc", "fsp-srv → stat(2)", Result, h_fs_GetEntryType, int32_t *out, const char *path) {
+#if defined(__ANDROID__)
+    const char *rel; cf_t *cf = cf_mount(path, &rel);
+    if (cf) {
+        if (cf_find(cf, rel)) { *out = ENT_FILE; return RES_OK; }
+        if (cf_is_dir(cf, rel)) { *out = ENT_DIR; return RES_OK; }
+        return RES_PATH_NOT_FOUND;
+    }
+#endif
     HP(path); struct stat st;
     if (stat(hp, &st)) return err_res("stat", hp);
     *out = S_ISDIR(st.st_mode) ? ENT_DIR : ENT_FILE; return RES_OK;
@@ -977,6 +1014,16 @@ static void dir_snapshot(dirh_t *h, const mount_t *m, const char *rest) {
     free(resolved); free(rel); free(guest); free(parent); free(all); free(names); free(roots);
 }
 HLE_FORCE("_ZN2nn2fs13OpenDirectoryEPNS0_15DirectoryHandleEPKci", "fsp-srv → opendir(3)", Result, h_fs_OpenDirectory, uint64_t *out, const char *path, int mode) {
+#if defined(__ANDROID__)
+    const char *rel; cf_t *cf = cf_mount(path, &rel);
+    if (cf) {   // a single-file RomFS container: the directory's entries come from the index
+        if (*rel && !cf_is_dir(cf, rel)) return RES_PATH_NOT_FOUND;
+        dirh_t *h = calloc(1, sizeof *h); if (!h) return RES_FAIL;
+        h->mode = mode; h->ro = 1;
+        cf_dir_entries(cf, rel, &h->snap, &h->nsnap);
+        *out = (uint64_t)h; return RES_OK;
+    }
+#endif
     HP(path); DIR *d = opendir(hp);
     if (!d) return err_res("opendir", hp);
     dirh_t *h = calloc(1, sizeof *h); h->d = d; strlcpy(h->path, hp, sizeof h->path); h->mode = mode;
@@ -1008,7 +1055,7 @@ HLE_FORCE("_ZN2nn2fs13ReadDirectoryEPlPNS0_14DirectoryEntryENS0_15DirectoryHandl
 }
 HLE_FORCE("_ZN2nn2fs14CloseDirectoryENS0_15DirectoryHandleE", "fsp-srv → closedir(3)", void, h_fs_CloseDirectory, uint64_t hh) {
     if (!hh) return;   // the game also closes after a failed open (handle 0): nothing to do in the original either
-    dirh_t *h = (dirh_t *)hh; closedir(h->d); if (h->od) closedir(h->od); free(h->snap); free(h);
+    dirh_t *h = (dirh_t *)hh; if (h->d) closedir(h->d); if (h->od) closedir(h->od); free(h->snap); free(h);
 }
 
 // ---------- Overloads from newer SDKs (SDK 16: MountRom without a cache, ReadFile without the bytes-read output / with read options, directory entry count) ----------
