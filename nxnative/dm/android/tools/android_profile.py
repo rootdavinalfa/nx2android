@@ -97,6 +97,8 @@ class AndroidProfile:
     def sysdata(self): return [int(t, 16) for t in self.get('sysdata').split()]   # title IDs
     @property
     def romfs_zstd(self): return self.get('romfs', 'raw') == 'zstd'   # the data pack's RomFS compressed (porter/romfs_pack.py)
+    @property
+    def romfs_container(self): return self.get('romfs', 'raw') == 'container'   # the data pack's RomFS as one file (porter/romfs_container.py)
 
     @property
     def settings(self):   # {'overlay': '1', ...}: the defaults the data pack's settings.txt starts with
@@ -119,7 +121,7 @@ class AndroidProfile:
         if self.status not in STATUS: bad.append(f'status {self.status!r}: one of {", ".join(STATUS)}')
         if not re.fullmatch(r'[a-z][a-z0-9_]*(\.[a-z][a-z0-9_]*)+', self.package): bad.append(f'package {self.package!r} is not a package name')
         if self.get('orientation', 'landscape') not in ('landscape', 'any'): bad.append('orientation: landscape or any')
-        if self.get('romfs', 'raw') not in ('raw', 'zstd'): bad.append('romfs: raw or zstd')
+        if self.get('romfs', 'raw') not in ('raw', 'zstd', 'container'): bad.append('romfs: raw, zstd or container')
         bad += [f'requires {r!r}: one of {", ".join(REQUIRES)}' for r in self.requires if r not in REQUIRES]
         bad += [f'sysdata {t!r}: a 16-digit hex title ID' for t in self.get('sysdata').split() if not re.fullmatch(r'[0-9A-Fa-f]{16}', t)]
         for v in self.values('setting'):

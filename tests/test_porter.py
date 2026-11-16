@@ -164,6 +164,23 @@ class DataPack(unittest.TestCase):
         finally:
             shutil.rmtree(t, ignore_errors=True)
 
+    def test_container_pack(self):
+        t = Path(tempfile.mkdtemp(prefix='nx2a_test_container_'))
+        try:
+            (t / 'patched').mkdir(); (t / 'patched/main.patched.bin').write_bytes(b'x' * 10)
+            (t / 'romfs/Data').mkdir(parents=True); (t / 'romfs/Data/a.bin').write_bytes(b'y' * 20)
+            (t / 'shaders.dmsv').write_bytes(b'DMSV')
+            from porter import romfs_container
+            romfs_container.pack(t / 'romfs', t / 'romfs.nxz')
+            p = profiles.load(NEO)
+            man = datapack.build(t / 'out-data', profile=p, version='v196608', display='1.03', patched=t / 'patched', container=t / 'romfs.nxz', shaders=t / 'shaders.dmsv')
+            o = t / 'out-data'
+            self.assertTrue((o / 'romfs.nxz').is_file()); self.assertFalse((o / 'RomFS').exists())
+            self.assertIn('DM_ROMFS_CONTAINER=/sdcard/Android/data/org.nx2a.neo/files/romfs.nxz', (o / 'env.txt').read_text())
+            self.assertEqual(man['files'], 3)   # the module, the container, the shaders
+        finally:
+            shutil.rmtree(t, ignore_errors=True)
+
     @unittest.skipUnless(any(Path(p).is_file() for p in pipeline.LETTER_FONTS), 'no letter font on this machine')
     def test_button_font(self):   # the Nintendo extension stand-in: made once, in the pack, named in env.txt (Super Mario Bros. Wonder's "Press L+R" drew '?' without it)
         try: from fontTools.ttLib import TTFont
