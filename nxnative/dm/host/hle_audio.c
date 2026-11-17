@@ -298,9 +298,17 @@ static void *au_watchdog(void *p) {
 static void au_watchdog_start(void) { pthread_t t; if (!pthread_create(&t, NULL, au_watchdog, NULL)) pthread_detach(t); }
 
 // AudioOutParameter = { int32 sampleRate; uint16 channelCount; uint16 _r; ... }, 0 = system default (48 kHz / 2 channels)
-HLE_FORCE("_ZN2nn5audio27InitializeAudioOutParameterEPNS0_17AudioOutParameterE", "audio output parameter defaults", void, h_au_InitParam, uint8_t *p) { memset(p, 0, 8); }
+// Logged once with its call site: a game that sets the parameter up but never reaches OpenAudioOut returned before the open (Wwise's channel check, for Engage), and one
+// that never gets here never reached its audio device init at all; without the line the two look identical (no audio #N either way)
+HLE_FORCE("_ZN2nn5audio27InitializeAudioOutParameterEPNS0_17AudioOutParameterE", "audio output parameter defaults", void, h_au_InitParam, uint8_t *p) {
+    static _Atomic int once; if (!atomic_exchange(&once, 1)) { char sb[64];
+        LOG("audio: the game set up an AudioOut parameter (call site %s); the open follows unless it rejects the device", site(__builtin_return_address(0), sb, sizeof sb)); }
+    memset(p, 0, 8);
+}
 // AudioOutInfo = { char name[256] }
 HLE_FORCE("_ZN2nn5audio13ListAudioOutsEPNS0_12AudioOutInfoEi", "audio output device list; 1 on the host", int, h_au_List, char *info, int n) {
+    static _Atomic int once; if (!atomic_exchange(&once, 1)) { char sb[64];
+        LOG("audio: the game listed the outputs → 1 (call site %s)", site(__builtin_return_address(0), sb, sizeof sb)); }
     if (n < 1) return 0;
     memset(info, 0, 256); strcpy(info, "DeviceOut"); return 1;
 }

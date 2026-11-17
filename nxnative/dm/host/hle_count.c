@@ -22,6 +22,7 @@ static void hc_write(void) {
     for (int k = 0; k < 256; k++) if (atomic_load(&g_hsvc[k])) fprintf(f, "SVC\t%#x\t%llu\n", k, (unsigned long long)atomic_load(&g_hsvc[k]));
     fclose(f); LOG("DM_HLECOUNT: %u entries → %s", g_nhc, pth);
 }
+static void *hc_tick(void *arg) { (void)arg; for (;;) { struct timespec ts = {30, 0}; nanosleep(&ts, NULL); hc_write(); } return NULL; }   // a copy every 30 s: an app that is killed (no atexit) still leaves its counts
 void *hlecount_wrap(const char *kind, const char *name, void *fn) {
     if (!hc_on() || !fn) return fn;
     if (g_hsealed) { static int once; if (!once++) LOG("[RED] DM_HLECOUNT: resolution after the pages were sealed (%s), later entries are not counted", name); return fn; }
@@ -45,6 +46,8 @@ void hlecount_seal(void) {
     g_hsealed = 1;
     sys_icache_invalidate(g_hcode, HC_MAX * 48);
     LOG("DM_HLECOUNT: %u counting stubs sealed", g_nhc);
+    // A copy every 30 s as well: an app that is killed (the Android app is force-stopped, no atexit) still leaves its counts, and a run needs no graceful exit
+    pthread_t t; if (!pthread_create(&t, NULL, hc_tick, NULL)) pthread_detach(t);
 }
 void hlecount_svc(int num) { if (g_hon > 0 && num >= 0 && num < 256) atomic_fetch_add(&g_hsvc[num], 1); }
 void hlecount_flush(void) { if (hc_on() && g_hcode) hc_write(); }   // Also write a copy on the graceful exit path (SIGTERM / scene disconnect)

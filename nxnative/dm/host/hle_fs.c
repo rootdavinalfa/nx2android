@@ -179,10 +179,12 @@ static cf_t *cf_open(const char *path) {
     if (!c->e || lseek(fd, (off_t)h.idx, SEEK_SET) < 0) { cf_close(c); return NULL; }
     for (uint32_t i = 0; i < h.n; i++) {
         uint16_t L; uint64_t raw, table; uint32_t bs, nb;
-        if (read(fd, &L, 2) != 2 || read(fd, &raw, 8) != 8 || read(fd, &bs, 4) != 4 || read(fd, &nb, 4) != 4 || read(fd, &table, 8) != 8) { cf_close(c); return NULL; }
+        if (read(fd, &L, 2) != 2) { cf_close(c); return NULL; }
         c->e[i].path = malloc((size_t)L + 1);
         if (!c->e[i].path || read(fd, c->e[i].path, L) != L) { cf_close(c); return NULL; }
-        c->e[i].path[L] = 0; c->e[i].raw = raw; c->e[i].bs = bs; c->e[i].n = nb; c->e[i].table = table;
+        c->e[i].path[L] = 0;
+        if (read(fd, &raw, 8) != 8 || read(fd, &bs, 4) != 4 || read(fd, &nb, 4) != 4 || read(fd, &table, 8) != 8) { cf_close(c); return NULL; }
+        c->e[i].raw = raw; c->e[i].bs = bs; c->e[i].n = nb; c->e[i].table = table;
     }
     qsort(c->e, c->n, sizeof *c->e, cf_cmp);
     return c;
@@ -780,7 +782,8 @@ HLE_FORCE("_ZN2nn2fs8OpenFileEPNS0_10FileHandleEPKci", "fsp-srv → open(2)", Re
     if (cf) {   // a single-file RomFS container: the entry's blocks are read on demand
         if (mode & (MODE_WRITE | MODE_APPEND)) return RES_FAIL;
         cf_entry_t *e = cf_find(cf, rel);
-        if (!e) return RES_PATH_NOT_FOUND;
+        if (!e) { if (g_flag.fs) LOG("fs open [%.2fs] %s: not in the container", (now_ns() - g_t0_ns) / 1e9, path); return RES_PATH_NOT_FOUND; }
+        if (g_flag.fs) LOG("fs open [%.2fs] %s mode=%d (container, %llu bytes)", (now_ns() - g_t0_ns) / 1e9, path, mode, (unsigned long long)e->raw);
         int fd = dup(cf->fd); if (fd < 0) return RES_FAIL;
         if (fd >= (int)sizeof g_fmode) { close(fd); die("fd beyond the table"); }
         g_fmode[fd] = (uint8_t)mode; *out = (uint64_t)fd; g_fsave[fd] = 0;
@@ -968,8 +971,9 @@ HLE_FORCE("_ZN2nn2fs12GetEntryTypeEPNS0_18DirectoryEntryTypeEPKc", "fsp-srv → 
 #if defined(__ANDROID__)
     const char *rel; cf_t *cf = cf_mount(path, &rel);
     if (cf) {
-        if (cf_find(cf, rel)) { *out = ENT_FILE; return RES_OK; }
-        if (cf_is_dir(cf, rel)) { *out = ENT_DIR; return RES_OK; }
+        if (cf_find(cf, rel)) { *out = ENT_FILE; if (g_flag.fs) LOG("fs stat [%.2fs] %s → file", (now_ns() - g_t0_ns) / 1e9, path); return RES_OK; }
+        if (cf_is_dir(cf, rel)) { *out = ENT_DIR; if (g_flag.fs) LOG("fs stat [%.2fs] %s → dir", (now_ns() - g_t0_ns) / 1e9, path); return RES_OK; }
+        if (g_flag.fs) LOG("fs stat [%.2fs] %s → NOT FOUND", (now_ns() - g_t0_ns) / 1e9, path);
         return RES_PATH_NOT_FOUND;
     }
 #endif
@@ -1021,6 +1025,7 @@ HLE_FORCE("_ZN2nn2fs13OpenDirectoryEPNS0_15DirectoryHandleEPKci", "fsp-srv → o
         dirh_t *h = calloc(1, sizeof *h); if (!h) return RES_FAIL;
         h->mode = mode; h->ro = 1;
         cf_dir_entries(cf, rel, &h->snap, &h->nsnap);
+        if (g_flag.fs) LOG("fs opendir [%.2fs] %s (container, %zu entries)", (now_ns() - g_t0_ns) / 1e9, path, h->nsnap);
         *out = (uint64_t)h; return RES_OK;
     }
 #endif
