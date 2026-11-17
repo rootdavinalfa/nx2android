@@ -1,4 +1,4 @@
-import tempfile, unittest
+import struct, tempfile, unittest
 from pathlib import Path
 from porter import romfs_container as rc
 
@@ -29,6 +29,20 @@ class ContainerTest(unittest.TestCase):
             self.assertEqual(files, 1)
             self.assertEqual(rc.unpack(dst, out), 1)
             self.assertEqual((out / 'empty.bin').read_bytes(), b'')
+
+    def test_index_entry_order(self):
+        with tempfile.TemporaryDirectory() as t:
+            src, dst = Path(t) / 'src', Path(t) / 'romfs.nxz'
+            src.mkdir(); (src / 'a.bin').write_bytes(b'x' * 10)
+            rc.pack(src, dst)
+            data = dst.read_bytes()
+            magic, ver, n, idx, data_off, _ = rc.HDR.unpack_from(data)
+            pos = idx
+            (L,) = rc.ENT.unpack_from(data, pos); pos += rc.ENT.size
+            self.assertEqual(data[pos:pos + L], b'a.bin')   # the path comes first, then raw/bs/n/table (hle_fs.c cf_open)
+            pos += L
+            raw, bs, nb, table = struct.unpack_from('<QIIQ', data, pos)
+            self.assertEqual(raw, 10)
 
     def test_rebuild_reuses_unchanged_blocks(self):
         with tempfile.TemporaryDirectory() as t:

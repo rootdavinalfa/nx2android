@@ -36,7 +36,7 @@ class Device(Adb):
     def installed(self, package): return self.installed_
     def requests_permission(self, package, perm): return self.requests
     def remote_md5(self, rdir, rels):
-        self.ops.append(('md5', rdir, len(rels)))
+        self.ops.append(('md5', rdir, len(rels), *rels))
         if self.md5 is False: return {}
         return {r: self.md5.get(f'{rdir}/{r}') or hashlib.md5(b'x' * self.fs[f'{rdir}/{r}']).hexdigest() for r in rels if f'{rdir}/{r}' in self.fs}
     def prepare_app_files(self, package): return False
@@ -290,6 +290,7 @@ class ContainerAt(unittest.TestCase):
         install.install(self.apk, self.data, 'adb', container_at='/sdcard/Games/Test/romfs.nxz')
         install.install(self.apk, self.data, 'adb')   # no --container-at: the earlier location is kept
         self.assertIn('DM_ROMFS_CONTAINER=/sdcard/Games/Test/romfs.nxz', dev.text[f'{FILES}/env.txt'])
+        self.assertEqual(dev.step('md5', 'romfs.nxz'), -1)   # the container is checked by size, not MD5'd (15 GB)
 
     def test_container_push_needs_container_at(self):
         with self.assertRaisesRegex(BuildError, 'container-at'):

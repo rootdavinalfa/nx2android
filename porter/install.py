@@ -215,7 +215,7 @@ def install(apk, data, adb_exe, serial=None, replace_signer=False, romfs_at=None
         have = adb.remote_sizes(files)   # again: an install with --replace-signer uninstalls first, and Android deletes the files folder with the app
         skip = (datapack.MANIFEST,) + (('env.txt',) if target else ()) + (('romfs.nxz',) if container_path else ())
         adb.push_tree(data, files, keep=datapack.KEEP_ON_DEVICE, skip=skip, exclude=(datapack.ROMFS,) if target else (),
-                      verify=lambda rel: rel.split('/', 1)[0] not in ('RomFS', 'aoc'),   # the game's own files change only with their version
+                      verify=lambda rel: rel.split('/', 1)[0] not in ('RomFS', 'aoc') and rel != 'romfs.nxz',   # the game's own files change only with their version; the container is checked by size
                       progress=lambda d, t, note: PROG.set(done=d, total=t, note=note), have=have)
         if container_path:   # the single-file RomFS, in resumable pieces, where the user asked for it
             PROG.set(step=f'pushing the RomFS container to {container_path}', done=0, total=container.stat().st_size, unit='B')
