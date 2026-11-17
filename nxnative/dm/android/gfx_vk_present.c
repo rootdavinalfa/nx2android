@@ -1003,6 +1003,7 @@ static pthread_mutex_t g_pq_mu = PTHREAD_MUTEX_INITIALIZER; static pthread_cond_
 // While the game is held (the pause menu) no frame comes: dm_overlay_redraw presents the last one again with what the overlay now shows.
 static _Atomic int g_redraw;
 void dm_overlay_redraw(void) { atomic_store(&g_redraw, 1); pthread_mutex_lock(&g_pq_mu); pthread_cond_broadcast(&g_pq_cv); pthread_mutex_unlock(&g_pq_mu); }
+__attribute__((weak)) void dm_start_hold(void) {}   // front_android.c: hold the game once the first frame is presented (the start screen)
 static void *present_thread(void *arg) {
     (void)arg; pthread_setname_np(pthread_self(), "vk present");
     typeof(g_pq[0]) last = {0};
@@ -1032,6 +1033,7 @@ static uint64_t present_enqueue(vkimg_t *im, const int crop[4], uint64_t n, doub
         return n;
     }
     pthread_once(&once, present_thread_start);
+    { static int held; if (!held) { held = 1; dm_start_hold(); } }   // the first frame is presented: the start screen can hold the game now
     pthread_mutex_lock(&g_pq_mu);
     while (g_pq_head - g_pq_tail >= PQ_N) pthread_cond_wait(&g_pq_cv, &g_pq_mu);   // never more than PQ_N frames behind
     typeof(g_pq[0]) *e = &g_pq[g_pq_head % PQ_N]; e->im = im; e->n = n; e->period = period; e->has_crop = crop != NULL; if (crop) memcpy(e->crop, crop, sizeof e->crop);

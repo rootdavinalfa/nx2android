@@ -153,7 +153,15 @@ static void on_pause(ANativeActivity *a) { (void)a; go_background(); dm_perf_gpu
 // Back in front, the game is out of focus until the window has the input focus again (Android sends it after onResume): without this it stayed OutOfFocus for good,
 // and Blasphemous 2's Unity, which asks for focus notifications, kept its title paused and ignored every press after a trip to another app. A window losing focus while in
 // front (a system dialog, the notification shade) is OutOfFocus as on the Switch's HOME overlay
-static void on_window_focus(ANativeActivity *a, int focused) { (void)a; if (atomic_load(&g_running) && !atomic_load(&g_bg)) dm_focus_set(focused ? 1 : 2); }
+// Android reports the window unfocused once at launch, before the first focus: a game that initializes its audio in that window (Wwise's OnApplicationFocus(false) suspends it) then
+// stays silent for the whole run. The first unfocus before any focus is ignored; a real loss of focus afterwards is reported as before
+static _Atomic int g_had_focus;
+static void on_window_focus(ANativeActivity *a, int focused) { (void)a;
+    if (!atomic_load(&g_running) || atomic_load(&g_bg)) return;
+    if (focused) atomic_store(&g_had_focus, 1);
+    else if (!atomic_load(&g_had_focus)) return;
+    dm_focus_set(focused ? 1 : 2);
+}
 // A save manager's request, or a RomFS the app cannot read (romfs_readable), asked the app to end (ANativeActivity_onCreate): Activity.finish() when it is resumed, through JNI on the main thread.
 // ANativeActivity_finish, from onCreate or from here, left the activity on the screen (Y700, Android 16), and porter's am start -W waited out its timeout
 static int g_quit;
@@ -1416,5 +1424,5 @@ static void start_host(void) {
     if (stk != MAP_FAILED) { mprotect(stk, guard, PROT_NONE); pthread_attr_setstack(&at, stk + guard, ssz); } else pthread_attr_setstacksize(&at, ssz);
     if (pthread_create(&t, &at, host_thread, NULL)) LOG("[RED] cannot start the host thread"); else pthread_detach(t);
     pthread_attr_destroy(&at);
-    if (atomic_load(&g_start_screen) || atomic_load(&g_romfs_missing)) hold_sync();   // the start screen holds the game
 }
+void dm_start_hold(void) { if (atomic_load(&g_start_screen)) { hold_sync(); dm_overlay_redraw(); } }   // gfx_vk_present.c calls it after the first frame: the start screen holds the game then
